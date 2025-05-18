@@ -176,3 +176,8 @@ cython_debug/
 .DS_Store
 
 .venv/
+
+# Ignore GGUF model files in the models directory
+models/gguf_models/*.gguf
+models/gguf_models/**/*.gguf 
+*.gguf 
