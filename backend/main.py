@@ -3,8 +3,9 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 from langchain_ollama import ChatOllama
-# from langchain_core.prompts import PromptTemplate # We might not need this for direct invocation
-from langchain_core.messages import HumanMessage # If sending a simple string to invoke
+from langchain_core.messages import HumanMessage
+
+from graph_orchestrator import app_graph, AgentState
 
 # --- Configuration ---
 OLLAMA_FACTUAL_FINN_MODEL_NAME = "factual-finn"
@@ -72,6 +73,9 @@ class FollowUpRequest(BaseModel): # New Pydantic model for Casey's input
     # but we could allow overriding it here if needed in the future.
     # instruction: str = "Given the previous statement from the knowledgeable AI, ask a relevant and engaging follow-up question..."
 
+class StartPodcastRequest(BaseModel):
+    initial_information: str
+
 # --- API Endpoints ---
 @app.get("/")
 async def root():
@@ -129,3 +133,39 @@ async def ask_follow_up_question(request: FollowUpRequest):
     except Exception as e:
         print(f"Error during Curious Casey (Ollama) API call: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get question from Curious Casey (Ollama): {str(e)}")
+    
+@app.post("/initiate_podcast_flow", response_model=AgentState) # Respond with the final state
+async def initiate_podcast_flow(request: StartPodcastRequest):
+    if not app_graph: # Should not happen if graph_orchestrator.py is imported correctly
+        raise HTTPException(status_code=500, detail="LangGraph application not initialized.")
+    if not factual_finn_llm or not curious_casey_llm: # Check if Ollama clients are ready
+         raise HTTPException(status_code=503, detail="One or more Ollama LLM clients are not ready.")
+
+
+    print(f"Received request to initiate podcast flow with: {request.initial_information[:100]}...")
+
+    # Prepare the initial state for the graph
+    initial_graph_input = AgentState(
+        initial_user_input=request.initial_information,
+        casey_question="",        # Will be filled by CURIOUS_CASEY node
+        finn_explanation="",      # Will be filled by FACTUAL_FINN node
+        conversation_history=[]   # Will be populated by the nodes
+    )
+
+    try:
+        print("Invoking LangGraph app_graph...")
+        # Use ainvoke to get the final state after the graph completes
+        # For more detailed streaming of events (like individual node outputs as they happen),
+        # you would use app_graph.astream_events(...) and process the events.
+        # For now, let's get the final state.
+        final_state = await app_graph.ainvoke(initial_graph_input, {"recursion_limit": 5}) # Added recursion_limit
+
+        # The final_state will be an AgentState dictionary
+        print(f"LangGraph execution complete. Final state: {final_state}")
+        return final_state # FastAPI will serialize this TypedDict to JSON
+
+    except Exception as e:
+        print(f"Error during LangGraph execution: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error in podcast flow: {str(e)}")

@@ -7,3 +7,4 @@ pydantic
 langchain
 langchain-core
 langchain-ollama
+langgraph
