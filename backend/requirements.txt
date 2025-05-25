@@ -1,10 +1,13 @@
+python-dotenv
+
 # Web Framework
 fastapi
 uvicorn[standard]
 pydantic
 
-# LangChain for Ollama integration
+# LangChain
 langchain
 langchain-core
 langchain-ollama
 langgraph
+langsmith

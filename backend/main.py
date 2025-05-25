@@ -7,6 +7,10 @@ from langchain_core.messages import HumanMessage
 
 from graph_orchestrator import app_graph, AgentState
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # --- Configuration ---
 OLLAMA_FACTUAL_FINN_MODEL_NAME = "factual-finn"
 OLLAMA_CURIOUS_CASEY_MODEL_NAME = "curious-casey" # New model name for Casey
@@ -49,7 +53,8 @@ async def lifespan(app: FastAPI):
         curious_casey_llm = ChatOllama(
             model=OLLAMA_CURIOUS_CASEY_MODEL_NAME,
             base_url=OLLAMA_BASE_URL,
-            temperature=0.7, # As discussed, might be good for question variety
+            temperature=0.7, 
+            stop=["\n", "<|eot_id|>", "<|end_of_text|>", "The knowledgeable AI just said:"]
         )
         print("Curious Casey ChatOllama client initialized.")
     except Exception as e:
@@ -149,7 +154,8 @@ async def initiate_podcast_flow(request: StartPodcastRequest):
         initial_user_input=request.initial_information,
         casey_question="",        # Will be filled by CURIOUS_CASEY node
         finn_explanation="",      # Will be filled by FACTUAL_FINN node
-        conversation_history=[]   # Will be populated by the nodes
+        conversation_history=[],  # Will be populated by the nodes
+        current_turn=0            # Initialize current_turn
     )
 
     try:
@@ -158,7 +164,7 @@ async def initiate_podcast_flow(request: StartPodcastRequest):
         # For more detailed streaming of events (like individual node outputs as they happen),
         # you would use app_graph.astream_events(...) and process the events.
         # For now, let's get the final state.
-        final_state = await app_graph.ainvoke(initial_graph_input, {"recursion_limit": 5}) # Added recursion_limit
+        final_state = await app_graph.ainvoke(initial_graph_input, {"recursion_limit": 10}) # Added recursion_limit
 
         # The final_state will be an AgentState dictionary
         print(f"LangGraph execution complete. Final state: {final_state}")
