@@ -1,11 +1,17 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+import os
 
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage
 
 from graph_orchestrator import app_graph, AgentState
+
+from pydub import AudioSegment # For concatinating audio
+from tts_utils import text_to_speech_elevenlabs_async as text_to_speech_file
+import time
 
 from dotenv import load_dotenv
 
@@ -15,6 +21,12 @@ load_dotenv()
 OLLAMA_FACTUAL_FINN_MODEL_NAME = "factual-finn"
 OLLAMA_CURIOUS_CASEY_MODEL_NAME = "curious-casey" # New model name for Casey
 OLLAMA_BASE_URL = "http://localhost:11434"
+
+# ElevenLabs
+CASEY_VOICE_ID = "F2OOWcJMWhX8wCsyT0oR" 
+FINN_VOICE_ID = "IFEvkitzF8OoHeggkJUu" 
+CASEY_TTS_MODEL_ID = "eleven_turbo_v2_5" 
+FINN_TTS_MODEL_ID = "eleven_multilingual_v2" 
 
 # Alpaca prompt template string (used for Factual Finn)
 alpaca_prompt_template_str = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
@@ -139,39 +151,137 @@ async def ask_follow_up_question(request: FollowUpRequest):
         print(f"Error during Curious Casey (Ollama) API call: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get question from Curious Casey (Ollama): {str(e)}")
     
-@app.post("/initiate_podcast_flow", response_model=AgentState) # Respond with the final state
-async def initiate_podcast_flow(request: StartPodcastRequest):
-    if not app_graph: # Should not happen if graph_orchestrator.py is imported correctly
+@app.post("/initiate_podcast_flow", response_model=AgentState)
+async def initiate_podcast_flow(request: StartPodcastRequest): # StartPodcastRequest should be defined
+    if not app_graph:
         raise HTTPException(status_code=500, detail="LangGraph application not initialized.")
     if not factual_finn_llm or not curious_casey_llm: # Check if Ollama clients are ready
          raise HTTPException(status_code=503, detail="One or more Ollama LLM clients are not ready.")
 
-
     print(f"Received request to initiate podcast flow with: {request.initial_information[:100]}...")
 
-    # Prepare the initial state for the graph
     initial_graph_input = AgentState(
         initial_user_input=request.initial_information,
-        casey_question="",        # Will be filled by CURIOUS_CASEY node
-        finn_explanation="",      # Will be filled by FACTUAL_FINN node
-        conversation_history=[],  # Will be populated by the nodes
-        current_turn=0            # Initialize current_turn
+        casey_question="",
+        finn_explanation="",
+        conversation_history=[],
+        current_turn=0,
+        generated_audio_file=None 
     )
 
     try:
         print("Invoking LangGraph app_graph...")
-        # Use ainvoke to get the final state after the graph completes
-        # For more detailed streaming of events (like individual node outputs as they happen),
-        # you would use app_graph.astream_events(...) and process the events.
-        # For now, let's get the final state.
-        final_state = await app_graph.ainvoke(initial_graph_input, {"recursion_limit": 10}) # Added recursion_limit
+        final_state_dict = await app_graph.ainvoke(initial_graph_input, {"recursion_limit": 10})
+        print(f"LangGraph execution complete. Final state from graph: {final_state_dict}")
 
-        # The final_state will be an AgentState dictionary
-        print(f"LangGraph execution complete. Final state: {final_state}")
-        return final_state # FastAPI will serialize this TypedDict to JSON
+        # --- TTS Generation with Distinct Voices ---
+        conversation_history = final_state_dict.get("conversation_history", [])
+        generated_audio_segments_paths = [] # To store paths of individual audio files
+        final_podcast_filename_only = None
+
+        if conversation_history:
+            audio_output_dir = "audio_outputs" # Ensure this directory exists
+            os.makedirs(audio_output_dir, exist_ok=True)
+
+            # Generate unique base for segment filenames for this request
+            request_timestamp = int(time.time())
+
+            for i, turn_text in enumerate(conversation_history):
+                speaker = ""
+                text_to_speak = ""
+                current_voice_id = ""
+                current_model_id = ""
+
+                if turn_text.startswith("Curious Casey:"):
+                    speaker = "Curious Casey"
+                    text_to_speak = turn_text.replace("Curious Casey: ", "", 1).strip()
+                    current_voice_id = CASEY_VOICE_ID
+                    current_model_id = CASEY_TTS_MODEL_ID # Or a common model
+                elif turn_text.startswith("Factual Finn:"):
+                    speaker = "Factual Finn"
+                    text_to_speak = turn_text.replace("Factual Finn: ", "", 1).strip()
+                    current_voice_id = FINN_VOICE_ID
+                    current_model_id = FINN_TTS_MODEL_ID # Or a common model
+                elif turn_text.startswith("Initial Topic:"):
+                    # Optionally, you could have a "Narrator" voice for the initial topic
+                    # For now, let's skip TTS for the "Initial Topic" or assign a default.
+                    # Or, have Casey "read" it as an intro.
+                    # Let's try having Casey read the intro topic in her voice for this example.
+                    speaker = "Narrator (Casey)" # Or just Casey
+                    text_to_speak = turn_text.replace("Initial Topic: ", "", 1).strip()
+                    current_voice_id = CASEY_VOICE_ID # Use Casey's voice for the intro topic
+                    current_model_id = CASEY_TTS_MODEL_ID
+                else:
+                    print(f"Skipping TTS for unknown speaker in turn: {turn_text}")
+                    continue
+
+                if not text_to_speak: # Skip empty turns
+                    continue
+
+                segment_filename_base = f"segment_{request_timestamp}_{i}_{speaker.replace(' ', '_').lower()}"
+
+                print(f"Converting turn {i+1} ({speaker}) to speech: '{text_to_speak[:50]}...'")
+                segment_path = await text_to_speech_file( # This is your ElevenLabs async function
+                    text=text_to_speak,
+                    output_filename_base=segment_filename_base,
+                    output_dir=audio_output_dir,
+                    voice_id=current_voice_id,
+                    model_id=current_model_id
+                    # voice_settings_dict can be added here if you want per-speaker settings
+                )
+                if segment_path: # text_to_speech_file now returns just the filename
+                    generated_audio_segments_paths.append(os.path.join(audio_output_dir, segment_path))
+                else:
+                    print(f"Failed to generate audio for segment: {speaker} - {text_to_speak[:50]}...")
+
+            # Concatenate audio segments if we have any
+            if generated_audio_segments_paths:
+                print("Concatenating audio segments...")
+                combined_audio = AudioSegment.empty()
+                for segment_path in generated_audio_segments_paths:
+                    try:
+                        sound_segment = AudioSegment.from_mp3(segment_path) # Assuming MP3 from ElevenLabs
+                        combined_audio += sound_segment
+                    except Exception as e:
+                        print(f"Error loading segment {segment_path} for concatenation: {e}")
+                        continue # Skip problematic segment
+
+                if len(combined_audio) > 0:
+                    final_podcast_filename_only = f"podcast_full_{request_timestamp}.mp3"
+                    final_podcast_full_path = os.path.join(audio_output_dir, final_podcast_filename_only)
+                    try:
+                        combined_audio.export(final_podcast_full_path, format="mp3")
+                        print(f"Final concatenated podcast audio saved: {final_podcast_full_path}")
+                        final_state_dict["generated_audio_file"] = final_podcast_filename_only
+                    except Exception as e:
+                        print(f"Error exporting combined audio: {e}")
+                        final_state_dict["generated_audio_file"] = None
+                else:
+                    print("No valid audio segments to combine.")
+                    final_state_dict["generated_audio_file"] = None
+            else:
+                print("No audio segments were generated.")
+                final_state_dict["generated_audio_file"] = None
+        else:
+            print("No conversation history to convert to speech.")
+            final_state_dict["generated_audio_file"] = None
+        # --- End TTS Generation ---
+
+        return final_state_dict
 
     except Exception as e:
-        print(f"Error during LangGraph execution: {e}")
+        print(f"Error during LangGraph or TTS execution: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error in podcast flow: {str(e)}")
+    
+@app.get("/get_podcast_audio/{filename}")
+async def get_podcast_audio(filename: str):
+    # Ensure the audio_outputs directory is correctly referenced
+    # (it should be relative to where main.py is running from, or use absolute paths)
+    file_path = os.path.join("audio_outputs", filename) 
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type='audio/mpeg', filename=filename)
+    else:
+        print(f"Audio file not found at: {file_path}")
+        raise HTTPException(status_code=404, detail="Audio file not found.")

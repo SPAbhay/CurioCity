@@ -181,3 +181,6 @@ cython_debug/
 models/gguf_models/*.gguf
 models/gguf_models/**/*.gguf 
 *.gguf 
+
+# Ignore audio files
+backend/audio_outputs/

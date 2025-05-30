@@ -11,3 +11,9 @@ langchain-core
 langchain-ollama
 langgraph
 langsmith
+
+# TTS (Cloud Based)
+elevenlabs
+
+# Audio Manipulation
+pydub
