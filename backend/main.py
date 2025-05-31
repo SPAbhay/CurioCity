@@ -1,34 +1,37 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import os
-
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage
-
-from graph_orchestrator import app_graph, AgentState
-
-from pydub import AudioSegment # For concatinating audio
-from tts_utils import text_to_speech_elevenlabs_async as text_to_speech_file
+import uuid
 import time
+import traceback # For detailed error logging
 
+from typing import Optional
+from langchain_ollama import ChatOllama
+from graph_orchestrator import app_graph, AgentState # Import your compiled graph and state definition
 from dotenv import load_dotenv
 
-load_dotenv()
+from fastapi.responses import FileResponse
+from tts_utils import text_to_speech_elevenlabs_async as text_to_speech_file # Your ElevenLabs TTS function
+from pydub import AudioSegment # For concatenating audio
+
+load_dotenv() 
 
 # --- Configuration ---
 OLLAMA_FACTUAL_FINN_MODEL_NAME = "factual-finn"
-OLLAMA_CURIOUS_CASEY_MODEL_NAME = "curious-casey" # New model name for Casey
-OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_CURIOUS_CASEY_MODEL_NAME = "curious-casey"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-# ElevenLabs
-CASEY_VOICE_ID = "F2OOWcJMWhX8wCsyT0oR" 
-FINN_VOICE_ID = "IFEvkitzF8OoHeggkJUu" 
-CASEY_TTS_MODEL_ID = "eleven_turbo_v2_5" 
-FINN_TTS_MODEL_ID = "eleven_multilingual_v2" 
+CASEY_VOICE_ID = os.getenv("CASEY_VOICE_ID", "F2OOWcJMWhX8wCsyT0oR")
+FINN_VOICE_ID = os.getenv("FINN_VOICE_ID", "IFEvkitzF8OoHeggkJUu")
+NARRATOR_VOICE_ID = os.getenv("NARRATOR_VOICE_ID", CASEY_VOICE_ID) # Defaulting to Casey for intro/topic
 
-# Alpaca prompt template string (used for Factual Finn)
+CASEY_TTS_MODEL_ID = os.getenv("CASEY_TTS_MODEL_ID", "eleven_turbo_v2_5")
+FINN_TTS_MODEL_ID = os.getenv("FINN_TTS_MODEL_ID", "eleven_multilingual_v2")
+NARRATOR_TTS_MODEL_ID = os.getenv("NARRATOR_TTS_MODEL_ID", CASEY_TTS_MODEL_ID)
+
+AUDIO_OUTPUT_DIR = "audio_outputs"
+
 alpaca_prompt_template_str = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
@@ -40,246 +43,268 @@ alpaca_prompt_template_str = """Below is an instruction that describes a task, p
 ### Response:
 """
 
-# Global variables for the LangChain ChatOllama instances
+# Global LLM clients
 factual_finn_llm = None
-curious_casey_llm = None # New LLM instance for Casey
+curious_casey_llm = None
 
-# --- FastAPI Lifespan for Ollama Client Initialization ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global factual_finn_llm, curious_casey_llm
+    global factual_finn_llm, curious_casey_llm, app_graph
+    os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True) # Ensure audio output dir exists
+    
     print(f"Initializing ChatOllama for Factual Finn: {OLLAMA_FACTUAL_FINN_MODEL_NAME}...")
     try:
         factual_finn_llm = ChatOllama(
-            model=OLLAMA_FACTUAL_FINN_MODEL_NAME,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0,
-        )
+            model=OLLAMA_FACTUAL_FINN_MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0,
+            stop=["<|eot_id|>", "<|end_of_text|>"])
         print("Factual Finn ChatOllama client initialized.")
     except Exception as e:
-        print(f"Error initializing Factual Finn ChatOllama client: {e}")
-        factual_finn_llm = None
-
+        print(f"Error initializing Factual Finn ChatOllama client: {e}\n{traceback.format_exc()}")
+    
     print(f"Initializing ChatOllama for Curious Casey: {OLLAMA_CURIOUS_CASEY_MODEL_NAME}...")
     try:
         curious_casey_llm = ChatOllama(
-            model=OLLAMA_CURIOUS_CASEY_MODEL_NAME,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0.7, 
-            stop=["\n", "<|eot_id|>", "<|end_of_text|>", "The knowledgeable AI just said:"]
-        )
+            model=OLLAMA_CURIOUS_CASEY_MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.7,
+            stop=["<|eot_id|>", "<|end_of_text|>", "\n\n", "The knowledgeable AI just said:"])
         print("Curious Casey ChatOllama client initialized.")
     except Exception as e:
-        print(f"Error initializing Curious Casey ChatOllama client: {e}")
-        curious_casey_llm = None
-    
-    yield
+        print(f"Error initializing Curious Casey ChatOllama client: {e}\n{traceback.format_exc()}")
 
+    if app_graph:
+        print("LangGraph app_graph loaded from orchestrator.")
+    else:
+        print("CRITICAL Error: LangGraph app_graph not loaded! Check graph_orchestrator.py.")
+    yield
     print("FastAPI app shutting down.")
 
 app = FastAPI(lifespan=lifespan)
 
-# --- Pydantic Models for Request Bodies ---
-class ExplanationRequest(BaseModel):
-    information_text: str
-    instruction: str = "Explain the following information in a direct and factual style, focusing on key points."
-
-class FollowUpRequest(BaseModel): # New Pydantic model for Casey's input
-    previous_statement: str
-    # Casey's instruction is baked into its fine-tuning and system prompt,
-    # but we could allow overriding it here if needed in the future.
-    # instruction: str = "Given the previous statement from the knowledgeable AI, ask a relevant and engaging follow-up question..."
-
+# --- Pydantic Models ---
 class StartPodcastRequest(BaseModel):
     initial_information: str
+    generate_audio: bool = False
+
+class SubmitDoubtRequest(BaseModel):
+    user_doubt_text: str
+    generate_audio: bool = False
+
+class ExplanationRequest(BaseModel):
+    information_text: str
+    instruction: str
+
+class FollowUpRequest(BaseModel):
+    previous_statement: str
+
+# --- Helper Function for Multi-Voice TTS ---
+async def _generate_podcast_audio(conversation_history: list, request_timestamp: int, filename_prefix: str) -> Optional[str]:
+    generated_audio_segments_paths = []
+    final_podcast_filename_only = None
+
+    if not conversation_history:
+        print("No conversation history to convert to speech.")
+        return None
+
+    for i, turn_text in enumerate(conversation_history):
+        speaker_label = ""
+        text_to_speak = ""
+        current_voice_id = ""
+        current_model_id = ""
+
+        if turn_text.startswith("Curious Casey:"):
+            speaker_label = "Casey"
+            text_to_speak = turn_text.replace("Curious Casey: ", "", 1).strip()
+            current_voice_id = CASEY_VOICE_ID
+            current_model_id = CASEY_TTS_MODEL_ID
+        elif turn_text.startswith("Factual Finn (addressing doubt):"):
+            speaker_label = "Finn_Doubt"
+            text_to_speak = turn_text.replace("Factual Finn (addressing doubt): ", "", 1).strip()
+            current_voice_id = FINN_VOICE_ID
+            current_model_id = FINN_TTS_MODEL_ID
+        elif turn_text.startswith("Factual Finn:"):
+            speaker_label = "Finn"
+            text_to_speak = turn_text.replace("Factual Finn: ", "", 1).strip()
+            current_voice_id = FINN_VOICE_ID
+            current_model_id = FINN_TTS_MODEL_ID
+        elif turn_text.startswith("Initial Topic:"):
+            speaker_label = "Narrator"
+            text_to_speak = turn_text.replace("Initial Topic: ", "", 1).strip()
+            current_voice_id = NARRATOR_VOICE_ID
+            current_model_id = NARRATOR_TTS_MODEL_ID
+        elif turn_text.startswith("User Doubt:"):
+            # Decide if you want to TTS the user's doubt.
+            # For now, let's skip TTSing the user's doubt text directly.
+            # The context is given to Finn, and Finn's answer will be voiced.
+            print(f"Skipping TTS for 'User Doubt' text: {turn_text[:50]}...")
+            continue
+        else:
+            print(f"Skipping TTS for unrecognized turn format: {turn_text[:50]}...")
+            continue
+
+        if not text_to_speak:
+            continue
+        
+        segment_filename_base = f"segment_{request_timestamp}_{i}_{speaker_label}"
+        
+        print(f"Converting turn {i+1} ({speaker_label}) for TTS: '{text_to_speak[:50]}...'")
+        segment_filename = await text_to_speech_file(
+            text=text_to_speak, 
+            output_filename_base=segment_filename_base,
+            output_dir=AUDIO_OUTPUT_DIR,
+            voice_id=current_voice_id,
+            model_id=current_model_id
+        )
+        if segment_filename:
+            generated_audio_segments_paths.append(os.path.join(AUDIO_OUTPUT_DIR, segment_filename))
+        else:
+            print(f"Failed to generate audio for segment: {speaker_label} - {text_to_speak[:50]}...")
+    
+    if generated_audio_segments_paths:
+        print("Concatenating audio segments...")
+        combined_audio = AudioSegment.empty()
+        for segment_path in generated_audio_segments_paths:
+            if os.path.exists(segment_path):
+                try:
+                    sound_segment = AudioSegment.from_mp3(segment_path)
+                    combined_audio += sound_segment
+                except Exception as e:
+                    print(f"Error loading audio segment {segment_path} for concatenation: {e}")
+            else:
+                print(f"Audio segment file not found, skipping: {segment_path}")
+        
+        if len(combined_audio) > 0:
+            final_podcast_filename_only = f"{filename_prefix}_{request_timestamp}.mp3"
+            final_podcast_full_path = os.path.join(AUDIO_OUTPUT_DIR, final_podcast_filename_only)
+            try:
+                combined_audio.export(final_podcast_full_path, format="mp3")
+                print(f"Final concatenated podcast audio saved: {final_podcast_full_path}")
+                return final_podcast_filename_only
+            except Exception as e:
+                print(f"Error exporting combined audio: {e}\n{traceback.format_exc()}")
+        else:
+            print("No valid audio segments to combine.")
+    else:
+        print("No audio segments were generated.")
+    return None
 
 # --- API Endpoints ---
 @app.get("/")
 async def root():
-    finn_status = "Ready" if factual_finn_llm else "Failed to Initialize"
-    casey_status = "Ready" if curious_casey_llm else "Failed to Initialize"
+    finn_status = "Ready" if factual_finn_llm else "Failed"
+    casey_status = "Ready" if curious_casey_llm else "Failed"
+    graph_status = "Ready" if app_graph else "Failed"
     return {
         "message": "AI Podcast Backend is running!",
         "factual_finn_status": finn_status,
-        "curious_casey_status": casey_status
+        "curious_casey_status": casey_status,
+        "langgraph_status": graph_status
     }
 
-@app.post("/explain") # For Factual Finn
-async def get_explanation(request: ExplanationRequest):
+@app.post("/explain", response_model=dict)
+async def get_explanation_from_finn_model(request: ExplanationRequest):
     if not factual_finn_llm:
-        raise HTTPException(status_code=503, detail="Factual Finn (Ollama) service not initialized or unavailable.")
-
-    print(f"Received request for Factual Finn: {request.information_text[:50]}...")
-    formatted_prompt = alpaca_prompt_template_str.format(
-        instruction=request.instruction,
-        input_text=request.information_text
-    )
+        raise HTTPException(status_code=503, detail="Factual Finn (Ollama) service not initialized.")
     try:
-        print(f"Sending prompt to Factual Finn (Ollama):\n{formatted_prompt}")
-        response = await factual_finn_llm.ainvoke(formatted_prompt)
-        explanation_text = response.content
-        print(f"Received response from Factual Finn (Ollama): {explanation_text[:100]}...")
-        return {"explanation": explanation_text.strip()}
+        full_prompt_for_finn = alpaca_prompt_template_str.format(
+            instruction=request.instruction,
+            input_text=request.information_text
+        )
+        response = await factual_finn_llm.ainvoke(full_prompt_for_finn)
+        return {"explanation": response.content.strip()}
     except Exception as e:
-        print(f"Error during Factual Finn (Ollama) API call: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get explanation from Factual Finn (Ollama): {str(e)}")
+        print(f"Error in /explain endpoint: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error generating explanation: {str(e)}")
 
-@app.post("/ask_follow_up") # New endpoint for Curious Casey
-async def ask_follow_up_question(request: FollowUpRequest):
+@app.post("/ask_follow_up", response_model=dict)
+async def get_question_from_casey_model(request: FollowUpRequest):
     if not curious_casey_llm:
-        raise HTTPException(status_code=503, detail="Curious Casey (Ollama) service not initialized or unavailable.")
-
-    print(f"Received request for Curious Casey: {request.previous_statement[:50]}...")
-    
-    # For Curious Casey, the input to its fine-tuning was:
-    # "The knowledgeable AI just said: '[previous_statement]'"
-    # This full string is what Casey expects as the user's prompt content.
-    # The instruction "Given the previous statement..." is part of Casey's fine-tuning
-    # and also reinforced by its Ollama system prompt.
-    casey_prompt_input = f"The knowledgeable AI just said: '{request.previous_statement}'"
-    
+        raise HTTPException(status_code=503, detail="Curious Casey (Ollama) service not initialized.")
     try:
-        print(f"Sending prompt to Curious Casey (Ollama):\n{casey_prompt_input}")
-        # We send this directly as the prompt to Casey, as its fine-tuning
-        # expects this as the "user" part of the conversation.
-        response = await curious_casey_llm.ainvoke(casey_prompt_input)
-        question_text = response.content
-        
-        print(f"Received question from Curious Casey (Ollama): {question_text[:100]}...")
-        return {"follow_up_question": question_text.strip()}
+        casey_direct_input = f"The knowledgeable AI just said: '{request.previous_statement}'"
+        response = await curious_casey_llm.ainvoke(casey_direct_input)
+        return {"follow_up_question": response.content.strip()}
     except Exception as e:
-        print(f"Error during Curious Casey (Ollama) API call: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get question from Curious Casey (Ollama): {str(e)}")
-    
+        print(f"Error in /ask_follow_up endpoint: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error generating question: {str(e)}")
+
 @app.post("/initiate_podcast_flow", response_model=AgentState)
-async def initiate_podcast_flow(request: StartPodcastRequest): # StartPodcastRequest should be defined
+async def initiate_podcast_flow_endpoint(request: StartPodcastRequest):
     if not app_graph:
         raise HTTPException(status_code=500, detail="LangGraph application not initialized.")
-    if not factual_finn_llm or not curious_casey_llm: # Check if Ollama clients are ready
-         raise HTTPException(status_code=503, detail="One or more Ollama LLM clients are not ready.")
-
-    print(f"Received request to initiate podcast flow with: {request.initial_information[:100]}...")
+    
+    conversation_thread_id = str(uuid.uuid4())
+    request_timestamp = int(time.time()) # For unique filenames if audio is generated
+    print(f"Initiating podcast flow. Thread ID: {conversation_thread_id}, Generate Audio: {request.generate_audio}")
 
     initial_graph_input = AgentState(
         initial_user_input=request.initial_information,
-        casey_question="",
-        finn_explanation="",
-        conversation_history=[],
-        current_turn=0,
-        generated_audio_file=None 
+        casey_question="", finn_explanation="", conversation_history=[],
+        current_turn=0, generated_audio_file=None, user_doubt=None
     )
+    config = {"configurable": {"thread_id": conversation_thread_id}, "recursion_limit": 15}
 
     try:
-        print("Invoking LangGraph app_graph...")
-        final_state_dict = await app_graph.ainvoke(initial_graph_input, {"recursion_limit": 10})
-        print(f"LangGraph execution complete. Final state from graph: {final_state_dict}")
+        final_state_dict = await app_graph.ainvoke(initial_graph_input, config=config)
+        print(f"LangGraph AI-AI flow complete for {conversation_thread_id}. Turns: {final_state_dict.get('current_turn')}")
 
-        # --- TTS Generation with Distinct Voices ---
-        conversation_history = final_state_dict.get("conversation_history", [])
-        generated_audio_segments_paths = [] # To store paths of individual audio files
-        final_podcast_filename_only = None
+        if request.generate_audio:
+            audio_filename = await _generate_podcast_audio(
+                final_state_dict.get("conversation_history", []),
+                request_timestamp,
+                "podcast_full"
+            )
+            final_state_dict["generated_audio_file"] = audio_filename
+        else:
+            final_state_dict["generated_audio_file"] = None
+            
+        return final_state_dict
+    except Exception as e:
+        print(f"Error in /initiate_podcast_flow endpoint: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error in podcast flow execution: {str(e)}")
 
-        if conversation_history:
-            audio_output_dir = "audio_outputs" # Ensure this directory exists
-            os.makedirs(audio_output_dir, exist_ok=True)
+@app.post("/submit_doubt/{thread_id}", response_model=AgentState)
+async def submit_doubt_endpoint(thread_id: str, request: SubmitDoubtRequest):
+    if not app_graph:
+        raise HTTPException(status_code=500, detail="LangGraph app not initialized.")
 
-            # Generate unique base for segment filenames for this request
-            request_timestamp = int(time.time())
+    request_timestamp = int(time.time()) # For unique filenames if audio is generated
+    print(f"Received doubt for thread_id: {thread_id}. Doubt: '{request.user_doubt_text}', Generate Audio: {request.generate_audio}")
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
+    
+    input_update = {"user_doubt": request.user_doubt_text}
 
-            for i, turn_text in enumerate(conversation_history):
-                speaker = ""
-                text_to_speak = ""
-                current_voice_id = ""
-                current_model_id = ""
+    try:
+        final_state_dict = await app_graph.ainvoke(input_update, config=config)
+        print(f"Graph resumed after doubt for {thread_id}. Turns: {final_state_dict.get('current_turn')}")
 
-                if turn_text.startswith("Curious Casey:"):
-                    speaker = "Curious Casey"
-                    text_to_speak = turn_text.replace("Curious Casey: ", "", 1).strip()
-                    current_voice_id = CASEY_VOICE_ID
-                    current_model_id = CASEY_TTS_MODEL_ID # Or a common model
-                elif turn_text.startswith("Factual Finn:"):
-                    speaker = "Factual Finn"
-                    text_to_speak = turn_text.replace("Factual Finn: ", "", 1).strip()
-                    current_voice_id = FINN_VOICE_ID
-                    current_model_id = FINN_TTS_MODEL_ID # Or a common model
-                elif turn_text.startswith("Initial Topic:"):
-                    # Optionally, you could have a "Narrator" voice for the initial topic
-                    # For now, let's skip TTS for the "Initial Topic" or assign a default.
-                    # Or, have Casey "read" it as an intro.
-                    # Let's try having Casey read the intro topic in her voice for this example.
-                    speaker = "Narrator (Casey)" # Or just Casey
-                    text_to_speak = turn_text.replace("Initial Topic: ", "", 1).strip()
-                    current_voice_id = CASEY_VOICE_ID # Use Casey's voice for the intro topic
-                    current_model_id = CASEY_TTS_MODEL_ID
-                else:
-                    print(f"Skipping TTS for unknown speaker in turn: {turn_text}")
-                    continue
-
-                if not text_to_speak: # Skip empty turns
-                    continue
-
-                segment_filename_base = f"segment_{request_timestamp}_{i}_{speaker.replace(' ', '_').lower()}"
-
-                print(f"Converting turn {i+1} ({speaker}) to speech: '{text_to_speak[:50]}...'")
-                segment_path = await text_to_speech_file( # This is your ElevenLabs async function
-                    text=text_to_speak,
-                    output_filename_base=segment_filename_base,
-                    output_dir=audio_output_dir,
-                    voice_id=current_voice_id,
-                    model_id=current_model_id
-                    # voice_settings_dict can be added here if you want per-speaker settings
+        if request.generate_audio:
+            # Identify new parts of history to TTS (User Doubt + Finn's answer to doubt)
+            history = final_state_dict.get("conversation_history", [])
+            new_segments_for_tts = []
+            if len(history) >= 2: # Heuristic: last two are doubt and answer
+                if history[-2].startswith("User Doubt:") and history[-1].startswith("Factual Finn (addressing doubt):"):
+                    new_segments_for_tts.append(history[-2]) # Optionally voice the user's doubt
+                    new_segments_for_tts.append(history[-1]) # Finn's answer to doubt
+            
+            if new_segments_for_tts:
+                audio_filename = await _generate_podcast_audio(
+                    new_segments_for_tts, # Only new segments
+                    request_timestamp,
+                    "doubt_response"
                 )
-                if segment_path: # text_to_speech_file now returns just the filename
-                    generated_audio_segments_paths.append(os.path.join(audio_output_dir, segment_path))
-                else:
-                    print(f"Failed to generate audio for segment: {speaker} - {text_to_speak[:50]}...")
-
-            # Concatenate audio segments if we have any
-            if generated_audio_segments_paths:
-                print("Concatenating audio segments...")
-                combined_audio = AudioSegment.empty()
-                for segment_path in generated_audio_segments_paths:
-                    try:
-                        sound_segment = AudioSegment.from_mp3(segment_path) # Assuming MP3 from ElevenLabs
-                        combined_audio += sound_segment
-                    except Exception as e:
-                        print(f"Error loading segment {segment_path} for concatenation: {e}")
-                        continue # Skip problematic segment
-
-                if len(combined_audio) > 0:
-                    final_podcast_filename_only = f"podcast_full_{request_timestamp}.mp3"
-                    final_podcast_full_path = os.path.join(audio_output_dir, final_podcast_filename_only)
-                    try:
-                        combined_audio.export(final_podcast_full_path, format="mp3")
-                        print(f"Final concatenated podcast audio saved: {final_podcast_full_path}")
-                        final_state_dict["generated_audio_file"] = final_podcast_filename_only
-                    except Exception as e:
-                        print(f"Error exporting combined audio: {e}")
-                        final_state_dict["generated_audio_file"] = None
-                else:
-                    print("No valid audio segments to combine.")
-                    final_state_dict["generated_audio_file"] = None
-            else:
-                print("No audio segments were generated.")
+                final_state_dict["generated_audio_file"] = audio_filename
+            else: # No new segments clearly identified or history too short
                 final_state_dict["generated_audio_file"] = None
         else:
-            print("No conversation history to convert to speech.")
             final_state_dict["generated_audio_file"] = None
-        # --- End TTS Generation ---
-
+            
         return final_state_dict
-
     except Exception as e:
-        print(f"Error during LangGraph or TTS execution: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error in podcast flow: {str(e)}")
-    
+        print(f"Error processing doubt for thread_id {thread_id}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error processing doubt: {str(e)}")
+
 @app.get("/get_podcast_audio/{filename}")
 async def get_podcast_audio(filename: str):
-    # Ensure the audio_outputs directory is correctly referenced
-    # (it should be relative to where main.py is running from, or use absolute paths)
-    file_path = os.path.join("audio_outputs", filename) 
+    file_path = os.path.join(AUDIO_OUTPUT_DIR, filename) 
     if os.path.exists(file_path):
         return FileResponse(file_path, media_type='audio/mpeg', filename=filename)
     else:
