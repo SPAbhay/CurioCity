@@ -6,7 +6,10 @@ import uuid
 import time
 import traceback # For detailed error logging
 
-from typing import Optional
+from typing import Optional, List
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import PromptTemplate
+from pydantic import BaseModel, Field
 from langchain_ollama import ChatOllama
 from graph_orchestrator import app_graph, AgentState # Import your compiled graph and state definition
 from dotenv import load_dotenv
@@ -83,6 +86,7 @@ app = FastAPI(lifespan=lifespan)
 class StartPodcastRequest(BaseModel):
     initial_information: str
     generate_audio: bool = False
+    user_provided_themes: Optional[List[str]] = None
 
 class SubmitDoubtRequest(BaseModel):
     user_doubt_text: str
@@ -94,6 +98,13 @@ class ExplanationRequest(BaseModel):
 
 class FollowUpRequest(BaseModel):
     previous_statement: str
+    
+class GenerateThemesRequest(BaseModel):
+    topic_info: str 
+    generation_prompt: str 
+    
+class GuidingThemesOutput(BaseModel):
+    themes: List[str] = Field(description="A list of 3 to 4 key open-ended questions or themes for the podcast.")
 
 # --- Helper Function for Multi-Voice TTS ---
 async def _generate_podcast_audio(conversation_history: list, request_timestamp: int, filename_prefix: str) -> Optional[str]:
@@ -227,40 +238,83 @@ async def get_question_from_casey_model(request: FollowUpRequest):
         raise HTTPException(status_code=500, detail=f"Error generating question: {str(e)}")
 
 @app.post("/initiate_podcast_flow", response_model=AgentState)
-async def initiate_podcast_flow_endpoint(request: StartPodcastRequest):
+async def initiate_podcast_flow(request: StartPodcastRequest): # Updated to use new StartPodcastRequest
     if not app_graph:
         raise HTTPException(status_code=500, detail="LangGraph application not initialized.")
-    
-    conversation_thread_id = str(uuid.uuid4())
-    request_timestamp = int(time.time()) # For unique filenames if audio is generated
+    if not factual_finn_llm or not curious_casey_llm:
+         raise HTTPException(status_code=503, detail="One or more Ollama LLM clients are not ready.")
+
+    conversation_thread_id = str(uuid.uuid4()) # Assuming uuid is imported
     print(f"Initiating podcast flow. Thread ID: {conversation_thread_id}, Generate Audio: {request.generate_audio}")
+    if request.user_provided_themes:
+        print(f"User provided themes: {request.user_provided_themes}")
 
     initial_graph_input = AgentState(
         initial_user_input=request.initial_information,
-        casey_question="", finn_explanation="", conversation_history=[],
-        current_turn=0, generated_audio_file=None, user_doubt=None
+        casey_question="", 
+        finn_explanation="", 
+        conversation_history=[],
+        current_turn=0, 
+        generated_audio_file=None, 
+        user_doubt=None,
+        guiding_themes=request.user_provided_themes, # Pass user themes if provided, else None
+        covered_themes=[] # Always initialize covered_themes as empty list
     )
-    config = {"configurable": {"thread_id": conversation_thread_id}, "recursion_limit": 15}
+
+    config = {"configurable": {"thread_id": conversation_thread_id}, "recursion_limit": 10}
 
     try:
-        final_state_dict = await app_graph.ainvoke(initial_graph_input, config=config)
-        print(f"LangGraph AI-AI flow complete for {conversation_thread_id}. Turns: {final_state_dict.get('current_turn')}")
+        print(f"Invoking LangGraph app_graph for thread_id: {conversation_thread_id}...")
+        final_state_dict = await app_graph.ainvoke(initial_graph_input, config=config) 
+        print(f"LangGraph execution complete for thread_id: {conversation_thread_id}. Final state from graph: {final_state_dict}")
 
-        if request.generate_audio:
-            audio_filename = await _generate_podcast_audio(
-                final_state_dict.get("conversation_history", []),
-                request_timestamp,
-                "podcast_full"
-            )
-            final_state_dict["generated_audio_file"] = audio_filename
+        # --- Conditional TTS Generation ---
+        if request.generate_audio: # Check the toggle
+            conversation_text_for_tts = "\n\n".join(final_state_dict.get("conversation_history", []))
+            generated_audio_filename_only = None
+
+            if conversation_text_for_tts:
+                audio_output_dir = "audio_outputs"
+                os.makedirs(audio_output_dir, exist_ok=True) # Ensure directory exists
+                request_timestamp = int(time.time()) # Ensure time is imported
+
+                # Pick a default voice or make it configurable if needed later
+                chosen_voice_id = CASEY_VOICE_ID # Or FINN_VOICE_ID, or a narrator voice
+                chosen_model_id = CASEY_TTS_MODEL_ID # Or your preferred model for this voice
+
+                segment_filename_base = f"podcast_full_conversation_{request_timestamp}"
+
+                print(f"Converting conversation to speech using voice {chosen_voice_id}...")
+                generated_audio_filename_only = await text_to_speech_file(
+                    text=conversation_text_for_tts, 
+                    output_filename_base=segment_filename_base, # Pass base name
+                    output_dir=audio_output_dir,
+                    voice_id=chosen_voice_id,
+                    model_id=chosen_model_id
+                )
+
+                if generated_audio_filename_only:
+                    print(f"Audio file generated: {generated_audio_filename_only}")
+                    final_state_dict["generated_audio_file"] = generated_audio_filename_only
+                else:
+                    print("Failed to generate audio file.")
+                    final_state_dict["generated_audio_file"] = None 
+            else:
+                print("No conversation history to convert to speech.")
+                final_state_dict["generated_audio_file"] = None
         else:
-            final_state_dict["generated_audio_file"] = None
-            
-        return final_state_dict
-    except Exception as e:
-        print(f"Error in /initiate_podcast_flow endpoint: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error in podcast flow execution: {str(e)}")
+            print("Audio generation skipped based on request toggle.")
+            final_state_dict["generated_audio_file"] = None # Ensure it's None if not generated
+        # --- End Conditional TTS Generation ---
 
+        return final_state_dict
+
+    except Exception as e:
+        print(f"Error during LangGraph or TTS execution: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error in podcast flow: {str(e)}")
+    
 @app.post("/submit_doubt/{thread_id}", response_model=AgentState)
 async def submit_doubt_endpoint(thread_id: str, request: SubmitDoubtRequest):
     if not app_graph:
@@ -310,3 +364,50 @@ async def get_podcast_audio(filename: str):
     else:
         print(f"Audio file not found at: {file_path}")
         raise HTTPException(status_code=404, detail="Audio file not found.")
+    
+@app.post("/generate_themes", response_model=GuidingThemesOutput) # Respond with the Pydantic model
+async def generate_themes_endpoint(request: GenerateThemesRequest):
+    if not curious_casey_llm: # Using Casey's LLM for theme generation
+        raise HTTPException(status_code=503, detail="Curious Casey LLM not initialized for theme generation.")
+
+    print(f"Received request to generate themes for topic: {request.topic_info[:50]}...")
+
+    # 1. Set up the PydanticOutputParser
+    parser = PydanticOutputParser(pydantic_object=GuidingThemesOutput)
+
+    # 2. Create a prompt template that includes the parser's format instructions
+    # The original_prompt is what you passed from graph_orchestrator.py
+    # We just need the topic_info here to build the new prompt for theme generation.
+
+    theme_prompt_template_str = """Based on the following main topic:
+    {topic_info}
+
+    Generate a list of 3 to 4 key open-ended questions or themes that a podcast host (Curious Casey) should explore to cover this topic comprehensively for an audience. These themes will guide Curious Casey's questioning.
+
+    {format_instructions}
+    """
+
+    prompt = PromptTemplate(
+        template=theme_prompt_template_str,
+        input_variables=["topic_info"],
+        partial_variables={"format_instructions": parser.get_format_instructions()}
+    )
+
+    chain = prompt | curious_casey_llm | parser # Create a simple chain
+
+    try:
+        # Invoke the chain with the topic info
+        # The parser will attempt to parse the LLM's string output into GuidingThemesOutput
+        response_pydantic = await chain.ainvoke({"topic_info": request.topic_info})
+
+        print(f"Generated and parsed themes: {response_pydantic.themes}")
+        return response_pydantic # FastAPI will serialize this Pydantic model
+
+    except Exception as e:
+        # This can include OutputParserException if the LLM output doesn't match the schema
+        print(f"Error in /generate_themes endpoint (LLM call or parsing): {e}\n{traceback.format_exc()}")
+        # Fallback or raise error
+        # For now, let's try to return a default if parsing fails, or raise an HTTP error
+        # A more robust fallback might be needed if the LLM consistently fails to format.
+        # For now, let's let it raise an HTTP error if parsing fails.
+        raise HTTPException(status_code=500, detail=f"Error generating or parsing themes: {str(e)}")
