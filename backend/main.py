@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 from fastapi.responses import FileResponse
 from tts_utils import text_to_speech_elevenlabs_async as text_to_speech_file # Your ElevenLabs TTS function
+from rag_utils import create_vector_store_from_text, get_retriever_for_doc
 from pydub import AudioSegment # For concatenating audio
 
 load_dotenv() 
@@ -98,7 +99,8 @@ app.add_middleware(
 
 # --- Pydantic Models ---
 class StartPodcastRequest(BaseModel):
-    initial_information: str
+    initial_information: str # This might now be more of a "topic summary" or can be derived from the doc
+    doc_id: str              # ID of the document processed by /process_document_for_rag
     generate_audio: bool = False
     user_provided_themes: Optional[List[str]] = None
 
@@ -107,8 +109,9 @@ class SubmitDoubtRequest(BaseModel):
     generate_audio: bool = False
 
 class ExplanationRequest(BaseModel):
-    information_text: str
-    instruction: str
+    instruction: str     # This will be Casey's question or the doubt-answering instruction
+    doc_id: str          # ID of the document to retrieve from
+    original_topic_or_context: Optional[str] = None # The initial user input or broader topic
 
 class FollowUpRequest(BaseModel):
     previous_statement: str
@@ -118,6 +121,10 @@ class GenerateThemesRequest(BaseModel):
     
 class GuidingThemesOutput(BaseModel):
     themes: List[str] = Field(description="A list of 3 to 4 key open-ended questions or themes for the podcast.")
+    
+class ProcessDocumentRequest(BaseModel):
+    doc_id: str 
+    text_content: str
 
 # --- Helper Function for Multi-Voice TTS ---
 async def _generate_podcast_audio(conversation_history: list, request_timestamp: int, filename_prefix: str) -> Optional[str]:
@@ -223,20 +230,104 @@ async def root():
         "langgraph_status": graph_status
     }
 
+@app.post("/process_document_for_rag", summary="Processes text content into an in-memory vector store for RAG")
+async def process_document_for_rag_endpoint(request: ProcessDocumentRequest):
+    if not request.doc_id or not request.text_content:
+        raise HTTPException(status_code=400, detail="doc_id and text_content are required.")
+
+    print(f"Received request to process document. Doc ID: {request.doc_id}, Content length: {len(request.text_content)}")
+
+    # Since create_vector_store_from_text is synchronous and potentially CPU-bound (embeddings)
+    # it's better to run it in a thread pool if it involves significant processing.
+    # Your current create_vector_store_from_text internally calls OllamaEmbeddings,
+    # which might be okay if Ollama itself handles requests efficiently.
+    # For now, let's call it directly; can optimize with run_in_threadpool if it blocks.
+
+    success = create_vector_store_from_text(request.doc_id, request.text_content)
+
+    if success:
+        # You could also test retrieval here for confirmation if desired
+        # retriever = get_retriever_for_doc(request.doc_id)
+        # if retriever:
+        #     test_query = "What is the main topic?" # A generic query
+        #     try:
+        #         # relevant_docs = await retriever.aget_relevant_documents(test_query)
+        #         # print(f"Test retrieval for {request.doc_id} found {len(relevant_docs)} docs for query '{test_query}'")
+        #         pass
+        #     except Exception as e:
+        #         print(f"Error during test retrieval: {e}")
+        return {"message": f"Document processed and vector store created/updated for doc_id: {request.doc_id}"}
+    else:
+        raise HTTPException(status_code=500, detail=f"Failed to process document and create vector store for doc_id: {request.doc_id}")
+
 @app.post("/explain", response_model=dict)
 async def get_explanation_from_finn_model(request: ExplanationRequest):
     if not factual_finn_llm:
         raise HTTPException(status_code=503, detail="Factual Finn (Ollama) service not initialized.")
+
+    retriever = get_retriever_for_doc(request.doc_id)
+    if not retriever:
+        raise HTTPException(status_code=404, detail=f"No document found for doc_id: {request.doc_id} to perform RAG.")
+
+    # The 'instruction' field from ExplanationRequest now contains Casey's question or the doubt query
+    query_for_retrieval = request.instruction 
+
+    print(f"Performing RAG retrieval for doc_id '{request.doc_id}' with query: '{query_for_retrieval[:100]}...'")
     try:
-        full_prompt_for_finn = alpaca_prompt_template_str.format(
-            instruction=request.instruction,
-            input_text=request.information_text
-        )
-        response = await factual_finn_llm.ainvoke(full_prompt_for_finn)
-        return {"explanation": response.content.strip()}
+        # relevant_docs = await retriever.aget_relevant_documents(query_for_retrieval) # If using async retriever
+        # For FAISS from_texts, get_relevant_documents is usually sync, run in threadpool
+        from fastapi.concurrency import run_in_threadpool
+        relevant_docs = await run_in_threadpool(retriever.get_relevant_documents, query_for_retrieval)
     except Exception as e:
-        print(f"Error in /explain endpoint: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error generating explanation: {str(e)}")
+        print(f"Error during RAG retrieval: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve relevant documents for RAG.")
+
+    retrieved_context = "\n\n".join([doc.page_content for doc in relevant_docs])
+    print(f"Retrieved context for LLM: '{retrieved_context[:200]}...'")
+
+    # Construct the prompt for Factual Finn, including the retrieved context
+    # The original 'request.instruction' IS Casey's question or the formatted doubt instruction.
+    # Factual Finn's fine-tuning instruction is about style.
+    # We need to combine Casey's question/doubt instruction with the retrieved context.
+
+    # Factual Finn's core fine-tuning instruction:
+    base_finn_instruction_style = "Explain the following information in a direct and factual style, focusing on key points."
+
+    # The information Finn should explain IS the retrieved_context, guided by Casey's question.
+    # So, Casey's question becomes part of the main instruction to Finn.
+    prompt_for_finn_llm = alpaca_prompt_template_str.format(
+        instruction=f"{request.instruction}\n\nUse the following retrieved context to formulate your answer:\n'''{retrieved_context}'''\n\n{base_finn_instruction_style}",
+        input_text="", # The main "input" is now the retrieved context included in the instruction.
+                       # Or, you could put retrieved_context here. Let's try instruction first.
+        # Alternatively, instruction could be Casey's question, and input_text is retrieved_context.
+        # Let's refine:
+        # instruction = Casey's Question / User Doubt Query
+        # input_text = Retrieved Context
+    )
+
+    # Refined prompt structure for Finn, assuming its fine-tuning instruction is about style
+    # and it now needs to answer a question based on provided input (context).
+    # The 'request.instruction' IS Casey's question or the 'address this doubt' instruction.
+    # The 'information_text' (input to Finn's fine-tuning format) will be the retrieved context.
+
+    final_instruction_for_finn = request.instruction # This is Casey's question or the doubt prompt
+    final_input_text_for_finn = f"Use the following context to answer the above: \n{retrieved_context}"
+    if request.original_topic_or_context:
+        final_input_text_for_finn = f"Original Topic: {request.original_topic_or_context}\n\n{final_input_text_for_finn}"
+
+
+    prompt_to_ollama = alpaca_prompt_template_str.format(
+        instruction=final_instruction_for_finn, # Casey's question or doubt addressing instruction
+        input_text=final_input_text_for_finn    # Retrieved context
+    )
+
+    try:
+        print(f"Sending to Factual Finn (Ollama) for RAG-based explanation. Instruction: {final_instruction_for_finn[:70]}...")
+        response = await factual_finn_llm.ainvoke(prompt_to_ollama)
+        return {"explanation": response.content.strip(), "retrieved_context_length": len(retrieved_context)}
+    except Exception as e:
+        print(f"Error in /explain endpoint (Ollama call): {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error generating RAG explanation: {str(e)}")
 
 @app.post("/ask_follow_up", response_model=dict)
 async def get_question_from_casey_model(request: FollowUpRequest):
@@ -264,6 +355,7 @@ async def initiate_podcast_flow(request: StartPodcastRequest): # Updated to use 
 
     initial_graph_input = AgentState(
         initial_user_input=request.initial_information,
+        doc_id=request.doc_id,
         casey_question="", 
         finn_explanation="", 
         conversation_history=[],

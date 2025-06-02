@@ -12,6 +12,12 @@ langchain-ollama
 langgraph
 langsmith
 
+# RAG Dependencies
+langchain_community
+faiss-cpu
+pypdf # For PDF files
+python-docx # For .docx files
+
 # TTS (Cloud Based)
 elevenlabs
 python-multipart

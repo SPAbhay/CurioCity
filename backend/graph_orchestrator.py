@@ -19,6 +19,7 @@ class AgentState(TypedDict):
     current_turn: int
     generated_audio_file: Optional[str]
     user_doubt: Optional[str] 
+    doc_id: Optional[str] 
     guiding_themes: Optional[List[str]]
     covered_themes: Optional[List[str]]
 
@@ -113,21 +114,24 @@ async def invoke_curious_casey(state: AgentState) -> dict:
     }
 
 async def invoke_factual_finn_explain(state: AgentState) -> dict:
-    print("---NODE: FACTUAL_FINN_EXPLAIN (Regular Explanation)---")
+    print("---NODE: FACTUAL_FINN_EXPLAIN (RAG Enabled)---")
     casey_question = state.get("casey_question")
-    initial_input = state.get("initial_user_input") # Finn always explains based on the initial input, guided by Casey
+    doc_id = state.get("doc_id")
+    initial_topic = state.get("initial_user_input") 
 
-    if not casey_question or not initial_input:
+    if not casey_question or not doc_id or not initial_topic:
         print("Error: Casey's question or initial input context not found for Factual Finn.")
-        return {"finn_explanation": "Error: Missing context for explanation.", "conversation_history": ["Error: Missing context for Finn's explanation."]}
+        return {"finn_explanation": "Error: Missing context/doc_id for RAG explanation."}
 
-    print(f"Finn received question: '{casey_question}' regarding initial topic: '{initial_input[:70]}...'")
+    print(f"Finn received question: '{casey_question}' for doc_id: '{doc_id}'")
     
-    finn_instruction = f"In response to the question: '{casey_question}', explain the relevant aspects of the following information: '{initial_input}' in a direct and factual style, focusing on key points."
-    
-    payload = {"information_text": initial_input, "instruction": finn_instruction}
+    payload = {
+        "instruction": casey_question, 
+        "doc_id": doc_id,
+        "original_topic_or_context": initial_topic 
+    }
     api_url = f"{BACKEND_API_BASE_URL}/explain"
-    finn_explanation_text = "I could not provide an explanation at this time." # Default
+    finn_explanation_text = "I could not provide an explanation at this time using RAG."
     new_history_entry = ""
 
     try:
@@ -136,64 +140,54 @@ async def invoke_factual_finn_explain(state: AgentState) -> dict:
             response.raise_for_status()
             response_data = response.json()
             finn_explanation_text = response_data.get("explanation", finn_explanation_text)
-        print(f"Finn generated explanation: '{finn_explanation_text[:100]}...'")
+        print(f"Finn (RAG) generated explanation: '{finn_explanation_text[:100]}...'")
         new_history_entry = f"Factual Finn: {finn_explanation_text}"
     except Exception as e:
-        print(f"Error in invoke_factual_finn_explain API call: {e}")
-        new_history_entry = f"Error: Factual Finn failed to provide explanation - {str(e)}"
-        
+        print(f"Error in invoke_factual_finn_explain (RAG) API call: {e}")
+        new_history_entry = f"Error: Factual Finn failed to provide RAG explanation - {str(e)}"
+
     return {
         "finn_explanation": finn_explanation_text,
         "conversation_history": [new_history_entry]
     }
 
 async def invoke_factual_finn_on_doubt(state: AgentState) -> dict:
-    print("---NODE: FACTUAL_FINN_ANSWER_DOUBT---")
+    print("---NODE: FACTUAL_FINN_ANSWER_DOUBT (RAG Enabled)---")
     user_doubt = state.get("user_doubt")
-    
-    # Context for the doubt will be the conversation so far.
-    # We can also include the initial topic for broader context if needed.
-    conversation_so_far = "\n".join(state.get("conversation_history", []))
-    initial_topic = state.get("initial_user_input", "the main topic")
+    doc_id = state.get("doc_id")
+    initial_topic = state.get("initial_user_input") # Original topic context
 
-    if not user_doubt:
-        print("Warning: FACTUAL_FINN_ANSWER_DOUBT called without a user_doubt in state. Clearing doubt and proceeding.")
-        return {"user_doubt": None, "finn_explanation": ""} 
+    if not user_doubt or not doc_id or not initial_topic:
+        # ... error handling ...
+        return {"finn_explanation": "Error: Missing doubt/doc_id for RAG answer.", "user_doubt": None}
 
-    print(f"Finn received user doubt: '{user_doubt}'")
+    print(f"Finn received user doubt: '{user_doubt}' for doc_id: '{doc_id}'")
 
-    # Instruction for Finn to address the doubt
-    finn_instruction = (
-        f"The ongoing podcast conversation is as follows:\n'''\n{conversation_so_far}\n'''\n\n"
-        f"A user (audience member) has interrupted with the following doubt or question: '{user_doubt}'.\n"
-        f"Please address this doubt directly and factually, using your knowledge of the overall topic: '{initial_topic}' and the preceding conversation as context. Focus on key points."
-    )
-    # The information_text for the /explain endpoint can be the initial topic or recent history
-    # Let's pass the initial topic as the primary context, the instruction provides the doubt.
+# The doubt itself is the main query for retrieval and synthesis
     payload = {
-        "information_text": initial_topic, 
-        "instruction": finn_instruction
+        "instruction": user_doubt, # The doubt is the query
+        "doc_id": doc_id,
+        "original_topic_or_context": initial_topic
     }
-    api_url = f"{BACKEND_API_BASE_URL}/explain"
-    finn_response_to_doubt = "I'm unable to address that specific doubt at the moment." # Default
+    pi_url = f"{BACKEND_API_BASE_URL}/explain"
+    finn_response_to_doubt = "I'm unable to address that specific doubt via RAG at the moment."
     new_history_entries = [f"User Doubt: {user_doubt}"]
-
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(api_url, json=payload, timeout=180.0)
             response.raise_for_status()
             response_data = response.json()
             finn_response_to_doubt = response_data.get("explanation", finn_response_to_doubt)
-        print(f"Finn generated response to doubt: '{finn_response_to_doubt[:100]}...'")
+        print(f"Finn (RAG) generated response to doubt: '{finn_response_to_doubt[:100]}...'")
         new_history_entries.append(f"Factual Finn (addressing doubt): {finn_response_to_doubt}")
     except Exception as e:
-        print(f"Error in invoke_factual_finn_on_doubt API call: {e}")
-        new_history_entries.append(f"Error: Factual Finn failed to answer doubt - {str(e)}")
-    
+        print(f"Error in invoke_factual_finn_on_doubt (RAG) API call: {e}")
+        new_history_entries.append(f"Error: Factual Finn failed to answer RAG doubt - {str(e)}")
+
     return {
-        "finn_explanation": finn_response_to_doubt, # This is Finn's answer to the doubt
+        "finn_explanation": finn_response_to_doubt,
         "conversation_history": new_history_entries,
-        "user_doubt": None,  # Clear the doubt after addressing it
+        "user_doubt": None,
     }
     
 async def generate_guiding_themes(state: AgentState) -> dict:
@@ -244,7 +238,7 @@ async def generate_guiding_themes(state: AgentState) -> dict:
 
     return {"guiding_themes": generated_themes_list, "covered_themes": []}
 
-MAX_CONVERSATION_TURNS = 1
+MAX_CONVERSATION_TURNS = 3
 
 def route_after_finn_node(state: AgentState) -> str:
     print(f"---ROUTER: route_after_finn_node (Current Turn: {state.get('current_turn', 0)}, User Doubt: {state.get('user_doubt') is not None})---")
