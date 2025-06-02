@@ -244,7 +244,7 @@ async def generate_guiding_themes(state: AgentState) -> dict:
 
     return {"guiding_themes": generated_themes_list, "covered_themes": []}
 
-MAX_CONVERSATION_TURNS = 3
+MAX_CONVERSATION_TURNS = 1
 
 def route_after_finn_node(state: AgentState) -> str:
     print(f"---ROUTER: route_after_finn_node (Current Turn: {state.get('current_turn', 0)}, User Doubt: {state.get('user_doubt') is not None})---")

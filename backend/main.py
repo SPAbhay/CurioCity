@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import os
@@ -82,6 +83,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+origins = [
+    "http://localhost:5173",  # Your Vue.js development server
+    "http://127.0.0.1:5173", # Also add this for good measure
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # Allows specified origins
+    allow_credentials=True, # Allows cookies (not strictly needed for this API yet)
+    allow_methods=["*"],    # Allows all methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],    # Allows all headers
+)
+
 # --- Pydantic Models ---
 class StartPodcastRequest(BaseModel):
     initial_information: str
@@ -101,7 +115,6 @@ class FollowUpRequest(BaseModel):
     
 class GenerateThemesRequest(BaseModel):
     topic_info: str 
-    generation_prompt: str 
     
 class GuidingThemesOutput(BaseModel):
     themes: List[str] = Field(description="A list of 3 to 4 key open-ended questions or themes for the podcast.")
@@ -270,41 +283,28 @@ async def initiate_podcast_flow(request: StartPodcastRequest): # Updated to use 
 
         # --- Conditional TTS Generation ---
         if request.generate_audio: # Check the toggle
-            conversation_text_for_tts = "\n\n".join(final_state_dict.get("conversation_history", []))
-            generated_audio_filename_only = None
+            # We use final_state_dict here as it's the most up-to-date state
+            history_for_tts = final_state_dict.get("conversation_history", [])
 
-            if conversation_text_for_tts:
-                audio_output_dir = "audio_outputs"
-                os.makedirs(audio_output_dir, exist_ok=True) # Ensure directory exists
-                request_timestamp = int(time.time()) # Ensure time is imported
-
-                # Pick a default voice or make it configurable if needed later
-                chosen_voice_id = CASEY_VOICE_ID # Or FINN_VOICE_ID, or a narrator voice
-                chosen_model_id = CASEY_TTS_MODEL_ID # Or your preferred model for this voice
-
-                segment_filename_base = f"podcast_full_conversation_{request_timestamp}"
-
-                print(f"Converting conversation to speech using voice {chosen_voice_id}...")
-                generated_audio_filename_only = await text_to_speech_file(
-                    text=conversation_text_for_tts, 
-                    output_filename_base=segment_filename_base, # Pass base name
-                    output_dir=audio_output_dir,
-                    voice_id=chosen_voice_id,
-                    model_id=chosen_model_id
+            if history_for_tts:
+                request_timestamp = int(time.time()) # Get current timestamp for unique filenames
+                print(f"Calling _generate_podcast_audio for initial flow (Thread ID: {conversation_thread_id})")
+                audio_filename = await _generate_podcast_audio(
+                    conversation_history=history_for_tts,
+                    request_timestamp=request_timestamp,
+                    filename_prefix="podcast_initiate" # Prefix for the final concatenated file
                 )
-
-                if generated_audio_filename_only:
-                    print(f"Audio file generated: {generated_audio_filename_only}")
-                    final_state_dict["generated_audio_file"] = generated_audio_filename_only
+                final_state_dict["generated_audio_file"] = audio_filename
+                if audio_filename:
+                     print(f"Multi-voice audio generated for initial flow: {audio_filename}")
                 else:
-                    print("Failed to generate audio file.")
-                    final_state_dict["generated_audio_file"] = None 
+                     print("Multi-voice audio generation failed for initial flow.")
             else:
-                print("No conversation history to convert to speech.")
+                print("No conversation history to convert to speech for initial flow.")
                 final_state_dict["generated_audio_file"] = None
         else:
-            print("Audio generation skipped based on request toggle.")
-            final_state_dict["generated_audio_file"] = None # Ensure it's None if not generated
+            print("Audio generation skipped based on request toggle for initial flow.")
+            final_state_dict["generated_audio_file"] = None
         # --- End Conditional TTS Generation ---
 
         return final_state_dict

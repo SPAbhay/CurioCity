@@ -14,6 +14,7 @@ langsmith
 
 # TTS (Cloud Based)
 elevenlabs
+python-multipart
 
 # Audio Manipulation
 pydub
