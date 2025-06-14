@@ -13,7 +13,7 @@ langgraph
 langsmith
 
 # RAG Dependencies
-langchain_community
+langchain-community
 faiss-cpu
 pypdf # For PDF files
 python-docx # For .docx files
