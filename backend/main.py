@@ -103,6 +103,9 @@ app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True
 
 
 # --- Pydantic Models (remain the same) ---
+class PodcastFlowResponse(BaseModel):
+    thread_id: str
+    state: AgentState 
 class StartPodcastRequest(BaseModel):
     initial_information: str
     doc_id: str
@@ -128,7 +131,6 @@ class CoverageEvaluationRequest(BaseModel):
 class CoverageEvaluationOutput(BaseModel):
     is_covered: bool = Field(description="Set to true if the theme was adequately covered, false otherwise.")
     reasoning: str = Field(description="A brief explanation for why the theme was or was not considered covered.")
-
 
 async def _generate_podcast_audio(conversation_history: list, request_timestamp: int, filename_prefix: str) -> Optional[str]:
     # (This function is complete and does not need changes)
@@ -310,7 +312,7 @@ async def evaluate_coverage_endpoint(request: CoverageEvaluationRequest):
             reasoning=f"Failed to evaluate due to an error: {str(e)}"
         )
 
-@app.post("/initiate_podcast_flow", response_model=AgentState)
+@app.post("/initiate_podcast_flow", response_model=PodcastFlowResponse)
 async def initiate_podcast_flow_endpoint(request: StartPodcastRequest):
     if not app_graph: raise HTTPException(status_code=500, detail="LangGraph application not initialized.")
     conversation_thread_id = str(uuid.uuid4()); request_timestamp = int(time.time()); print(f"Initiating podcast flow. Thread ID: {conversation_thread_id}, Generate Audio: {request.generate_audio}")
@@ -322,7 +324,7 @@ async def initiate_podcast_flow_endpoint(request: StartPodcastRequest):
         print(f"LangGraph AI-AI flow complete for {conversation_thread_id}. Turns: {final_state_dict.get('current_turn')}")
         if request.generate_audio: final_state_dict["generated_audio_file"] = await _generate_podcast_audio(final_state_dict.get("conversation_history", []), request_timestamp, "podcast_initiate")
         else: final_state_dict["generated_audio_file"] = None
-        return final_state_dict
+        return PodcastFlowResponse(thread_id=conversation_thread_id, state=final_state_dict)
     except Exception as e: print(f"Error in /initiate_podcast_flow endpoint: {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail=f"Error in podcast flow execution: {str(e)}")
     
 @app.post("/submit_doubt/{thread_id}", response_model=AgentState)

@@ -94,7 +94,7 @@ async def text_to_speech_elevenlabs_async(
         try:
             current_voice_settings = VoiceSettings(**voice_settings_dict)
         except Exception as e:
-            print(f"Warning: Could not parse voice_settings_dict: {e}. Using default voice settings.")
+    ~~        print(f"Warning: Could not parse voice_settings_dict: {e}. Using default voice settings.")
 
     result_path = await run_in_threadpool(
         _generate_and_save_audio_blocking, 
