@@ -1,5 +1,5 @@
 <script setup>
-import { defineProps, computed } from 'vue';
+import { computed } from 'vue';
 
 const props = defineProps({
   conversationHistory: {
@@ -8,10 +8,12 @@ const props = defineProps({
   }
 });
 
-// Optional: A computed property to make it easier to display speakers
 const formattedHistory = computed(() => {
+  if (!props.conversationHistory || props.conversationHistory.length === 0) {
+    return [];
+  }
   return props.conversationHistory.map(entry => {
-    let speaker = "Unknown";
+    let speaker = "System";
     let message = entry;
     if (entry.startsWith("Initial Topic:")) {
       speaker = "Topic";
@@ -20,7 +22,7 @@ const formattedHistory = computed(() => {
       speaker = "Curious Casey";
       message = entry.replace("Curious Casey: ", "");
     } else if (entry.startsWith("Factual Finn (addressing doubt):")) {
-      speaker = "Factual Finn (Doubt)";
+      speaker = "Factual Finn";
       message = entry.replace("Factual Finn (addressing doubt): ", "");
     } else if (entry.startsWith("Factual Finn:")) {
       speaker = "Factual Finn";
@@ -38,28 +40,25 @@ const formattedHistory = computed(() => {
   <div class="podcast-display" v-if="formattedHistory.length > 0">
     <h2>Podcast Conversation</h2>
     <div class="conversation-log">
-      <div v-for="(turn, index) in formattedHistory" :key="index" class="turn">
+      <div v-for="(turn, index) in formattedHistory" :key="index" :class="['turn', turn.speaker.toLowerCase().replace(/\s+/g, '-')]">
         <strong class="speaker">{{ turn.speaker }}:</strong>
         <p class="message">{{ turn.message }}</p>
       </div>
     </div>
   </div>
-  <div v-else class="podcast-display">
-    <p>No podcast content generated yet. Fill out the form above to start!</p>
-  </div>
 </template>
 
 <style scoped>
 .podcast-display {
-  margin-top: 20px;
-  padding: 20px;
+  margin-top: 2rem;
+  padding: 25px;
   background-color: #2f2f2f;
   border-radius: 8px;
   text-align: left;
 }
 .conversation-log .turn {
-  margin-bottom: 15px;
-  padding-bottom: 10px;
+  margin-bottom: 1.25rem;
+  padding-bottom: 1.25rem;
   border-bottom: 1px solid #444;
 }
 .conversation-log .turn:last-child {
@@ -68,17 +67,31 @@ const formattedHistory = computed(() => {
   padding-bottom: 0;
 }
 .speaker {
-  color: #00aaff; /* Example speaker color */
-  margin-right: 5px;
+  font-weight: bold;
+  margin-right: 8px;
+}
+.turn.curious-casey .speaker, .turn.narrator .speaker {
+  color: #63a4ff;
+}
+.turn.factual-finn .speaker, .turn.factual-finn-(addressing-doubt) .speaker {
+  color: #ff9900;
+}
+.turn.your-question .speaker {
+  color: #33cc33;
+}
+.turn.topic .speaker {
+  color: #ccc;
 }
 .message {
   margin-top: 5px;
   margin-bottom: 0;
-  white-space: pre-wrap; /* Preserve line breaks from the AI */
+  white-space: pre-wrap;
   color: #e0e0e0;
+  line-height: 1.6;
 }
 h2 {
   text-align: center;
-  margin-bottom: 15px;
+  margin-top: 0;
+  margin-bottom: 1.5rem;
 }
 </style>

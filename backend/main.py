@@ -103,31 +103,50 @@ app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True
 
 
 # --- Pydantic Models (remain the same) ---
+class ProposeThemesResponse(BaseModel):
+    thread_id: str
+    themes: List[str]
+
+# NEW: For the request to the new theme proposal endpoint
+class ProposeThemesRequest(BaseModel):
+    initial_information: str
+    user_provided_themes: Optional[List[str]] = None
+    doc_id: str # We need the doc_id here to associate with the thread
+
+# MODIFIED: This request now starts a flow that has already been prepared
+class StartPodcastRequest(BaseModel):
+    final_themes: List[str]
+    doc_id: str
+    initial_information: str
+    generate_audio: bool = False
+
 class PodcastFlowResponse(BaseModel):
     thread_id: str
-    state: AgentState 
-class StartPodcastRequest(BaseModel):
-    initial_information: str
-    doc_id: str
-    generate_audio: bool = False
-    user_provided_themes: Optional[List[str]] = None
+    state: AgentState
+
 class SubmitDoubtRequest(BaseModel):
     user_doubt_text: str
     generate_audio: bool = False
+
 class ExplanationRequest(BaseModel):
     instruction: str
     doc_id: str
     original_topic_or_context: Optional[str] = None
+
 class FollowUpRequest(BaseModel):
     previous_statement: str
+
 class GenerateThemesRequest(BaseModel):
     topic_info: str 
+
 class GuidingThemesOutput(BaseModel):
     themes: List[str] = Field(description="A list of 3 to 4 key open-ended questions or themes for the podcast.")
+
 class CoverageEvaluationRequest(BaseModel):
     targeted_theme: str
     question: str
     answer: str
+
 class CoverageEvaluationOutput(BaseModel):
     is_covered: bool = Field(description="Set to true if the theme was adequately covered, false otherwise.")
     reasoning: str = Field(description="A brief explanation for why the theme was or was not considered covered.")
@@ -202,7 +221,7 @@ async def get_explanation_from_finn_model(request: ExplanationRequest):
     if not retriever: raise HTTPException(status_code=404, detail=f"No document found for doc_id: {request.doc_id}.")
     query_for_retrieval = request.instruction
     try:
-        relevant_docs = await run_in_threadpool(retriever.get_relevant_documents, query_for_retrieval)
+        relevant_docs = await retriever.ainvoke(query_for_retrieval)
     except Exception as e:
         print(f"Error during RAG retrieval: {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail="Failed to retrieve relevant documents.")
     retrieved_context = "\n\n".join([doc.page_content for doc in relevant_docs]) if relevant_docs else "No specific context found in the document for this query."
@@ -312,21 +331,88 @@ async def evaluate_coverage_endpoint(request: CoverageEvaluationRequest):
             reasoning=f"Failed to evaluate due to an error: {str(e)}"
         )
 
-@app.post("/initiate_podcast_flow", response_model=PodcastFlowResponse)
-async def initiate_podcast_flow_endpoint(request: StartPodcastRequest):
-    if not app_graph: raise HTTPException(status_code=500, detail="LangGraph application not initialized.")
-    conversation_thread_id = str(uuid.uuid4()); request_timestamp = int(time.time()); print(f"Initiating podcast flow. Thread ID: {conversation_thread_id}, Generate Audio: {request.generate_audio}")
-    if request.user_provided_themes: print(f"User provided themes: {request.user_provided_themes}")
-    initial_graph_input = AgentState(initial_user_input=request.initial_information, doc_id=request.doc_id, casey_question="", finn_explanation="", conversation_history=[], current_turn=0, generated_audio_file=None, user_doubt=None, guiding_themes=request.user_provided_themes, covered_themes=[], current_targeted_theme=None)
-    config = {"configurable": {"thread_id": conversation_thread_id}, "recursion_limit": 15}
-    try:
-        final_state_dict = await app_graph.ainvoke(initial_graph_input, config=config)
-        print(f"LangGraph AI-AI flow complete for {conversation_thread_id}. Turns: {final_state_dict.get('current_turn')}")
-        if request.generate_audio: final_state_dict["generated_audio_file"] = await _generate_podcast_audio(final_state_dict.get("conversation_history", []), request_timestamp, "podcast_initiate")
-        else: final_state_dict["generated_audio_file"] = None
-        return PodcastFlowResponse(thread_id=conversation_thread_id, state=final_state_dict)
-    except Exception as e: print(f"Error in /initiate_podcast_flow endpoint: {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail=f"Error in podcast flow execution: {str(e)}")
+@app.post("/propose_themes", response_model=ProposeThemesResponse)
+async def propose_themes_endpoint(request: ProposeThemesRequest):
+    """
+    Generates a thread_id and proposes guiding themes for a new podcast.
+    It does NOT start the graph execution.
+    """
+    thread_id = str(uuid.uuid4())
+    print(f"Proposing themes for new thread_id: {thread_id}")
     
+    themes = []
+    if request.user_provided_themes:
+        print(f"Using user-provided themes: {request.user_provided_themes}")
+        themes = request.user_provided_themes
+    else:
+        print("No user themes provided, generating themes with AI...")
+        try:
+            # We can call our existing theme generation endpoint internally
+            generated_themes_output = await generate_themes_endpoint(
+                GenerateThemesRequest(topic_info=request.initial_information)
+            )
+            themes = generated_themes_output.themes
+        except Exception as e:
+            print(f"Error generating themes: {e}")
+            raise HTTPException(status_code=500, detail="Failed to generate guiding themes.")
+    
+    # Here we will pre-populate the initial state for the thread.
+    # This is important so that when we start the flow later, the context is not lost.
+    initial_graph_input = AgentState(
+        initial_user_input=request.initial_information,
+        doc_id=request.doc_id,
+        guiding_themes=themes, # Using the approved themes
+        covered_themes=[],
+        casey_question="",
+        finn_explanation="",
+        conversation_history=[],
+        current_turn=0,
+        generated_audio_file=None,
+        user_doubt=None,
+        current_targeted_theme=None
+    )
+    config = {"configurable": {"thread_id": thread_id}}
+    # We update the state in the checkpointer without running the graph
+    app_graph.update_state(config, initial_graph_input)
+    print(f"Initial state saved for thread_id: {thread_id}")
+
+    return ProposeThemesResponse(thread_id=thread_id, themes=themes)
+
+@app.post("/initiate_podcast_flow/{thread_id}", response_model=AgentState)
+async def initiate_podcast_flow_endpoint(thread_id: str, request: StartPodcastRequest):
+    """
+    Starts the graph execution for a pre-configured thread_id with user-approved themes.
+    """
+    if not app_graph:
+        raise HTTPException(status_code=500, detail="LangGraph application not initialized.")
+    
+    print(f"--- Initiating podcast flow for thread_id: {thread_id} ---")
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
+    
+    # The initial state is already in the checkpointer.
+    # We just need to update it with the final, user-approved themes.
+    state_update = {"guiding_themes": request.final_themes}
+    app_graph.update_state(config, state_update)
+
+    try:
+        # We invoke with None because the state is already saved. The graph will start from its entry point.
+        final_state_dict = await app_graph.ainvoke(None, config=config)
+        
+        print(f"LangGraph flow initiated and paused for {thread_id}. Turns: {final_state_dict.get('current_turn')}")
+        
+        # Audio generation logic can remain for when we add a "Bulk Mode"
+        if request.generate_audio:
+            request_timestamp = int(time.time())
+            final_state_dict["generated_audio_file"] = await _generate_podcast_audio(final_state_dict.get("conversation_history", []), request_timestamp, "podcast_initiate")
+        else:
+            final_state_dict["generated_audio_file"] = None
+        
+        # The response model is now just AgentState directly
+        return final_state_dict
+    except Exception as e:
+        print(f"Error in /initiate_podcast_flow endpoint: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error in podcast flow execution: {str(e)}")
+        
 @app.post("/submit_doubt/{thread_id}", response_model=AgentState)
 async def submit_doubt_endpoint(thread_id: str, request: SubmitDoubtRequest):
     if not app_graph: raise HTTPException(status_code=500, detail="LangGraph app not initialized.")
@@ -345,6 +431,33 @@ async def submit_doubt_endpoint(thread_id: str, request: SubmitDoubtRequest):
         return final_state_dict
     except Exception as e: print(f"Error processing doubt for thread_id {thread_id}: {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail=f"Error processing doubt: {str(e)}")
     
+@app.post("/continue_flow/{thread_id}", response_model=AgentState)
+async def continue_podcast_flow_endpoint(thread_id: str):
+    """
+    Resumes a paused graph execution for the given thread_id.
+    """
+    if not app_graph:
+        raise HTTPException(status_code=500, detail="LangGraph app not initialized.")
+    
+    print(f"--- Resuming podcast flow for thread_id: {thread_id} ---")
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
+
+    try:
+        # Calling ainvoke with None input on a thread that is paused
+        # will resume it from where it left off.
+        final_state_dict = await app_graph.ainvoke(None, config=config)
+        
+        print(f"Graph resumed and paused again for {thread_id}. Current turns: {final_state_dict.get('current_turn')}")
+        
+        # We won't generate audio here, we'll do that at the very end.
+        final_state_dict["generated_audio_file"] = None
+        
+        return final_state_dict
+
+    except Exception as e:
+        print(f"Error resuming flow for thread_id {thread_id}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error resuming podcast flow: {str(e)}")    
+
 @app.get("/get_podcast_audio/{filename}")
 async def get_podcast_audio(filename: str):
     file_path = os.path.join(AUDIO_OUTPUT_DIR, filename); 

@@ -6,13 +6,6 @@ from elevenlabs import VoiceSettings # For detailed voice customization
 from fastapi.concurrency import run_in_threadpool
 import asyncio
 
-# --- ElevenLabs Client Initialization ---
-# It's often better to initialize the client once if the API key doesn't change.
-# However, for safety within threadpool and potential key changes via .env,
-# initializing it inside the blocking function or ensuring thread-safety is key.
-# For now, let's keep initialization inside _generate_and_save_audio_blocking
-# to ensure it picks up the env var correctly in the thread.
-
 def _generate_and_save_audio_blocking(
     text: str, 
     voice_id: str, 
@@ -94,7 +87,7 @@ async def text_to_speech_elevenlabs_async(
         try:
             current_voice_settings = VoiceSettings(**voice_settings_dict)
         except Exception as e:
-    ~~        print(f"Warning: Could not parse voice_settings_dict: {e}. Using default voice settings.")
+            print(f"Warning: Could not parse voice_settings_dict: {e}. Using default voice settings.")
 
     result_path = await run_in_threadpool(
         _generate_and_save_audio_blocking, 

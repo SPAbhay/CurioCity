@@ -23,29 +23,6 @@ class AgentState(TypedDict):
 BACKEND_API_BASE_URL = os.getenv("BACKEND_API_URL", "http://127.0.0.1:8000")
 
 # --- Node Functions ---
-
-async def generate_guiding_themes(state: AgentState) -> dict:
-    # This function remains the same as your working version
-    print("---NODE: GENERATE_GUIDING_THEMES---")
-    if state.get("guiding_themes") and isinstance(state.get("guiding_themes"), list) and state.get("guiding_themes"):
-        print(f"Using user-provided guiding themes: {state.get('guiding_themes')}")
-        return {"guiding_themes": state.get("guiding_themes"), "covered_themes": []}
-    initial_input = state.get("initial_user_input")
-    if not initial_input: return {"guiding_themes": [], "covered_themes": []}
-    api_url = f"{BACKEND_API_BASE_URL}/generate_themes"
-    generated_themes_list = []
-    default_themes_on_failure = [f"Explore core features of '{initial_input[:30]}...'.", f"Discuss applications of '{initial_input[:30]}...'.", "Consider future outlook."]
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(api_url, json={"topic_info": initial_input}, timeout=120.0); response.raise_for_status()
-            generated_themes_list = response.json().get("themes", []) or default_themes_on_failure
-        print(f"AI Generated and Parsed Guiding Themes: {generated_themes_list}")
-    except Exception as e:
-        print(f"Error calling /generate_themes API: {e}"); generated_themes_list = default_themes_on_failure
-        print(f"Using default guiding themes due to API error: {generated_themes_list}")
-    return {"guiding_themes": generated_themes_list, "covered_themes": []}
-
-
 async def invoke_curious_casey(state: AgentState) -> dict:
     # This function is modified to set 'current_targeted_theme'
     print("---NODE: CURIOUS_CASEY---")
@@ -185,23 +162,21 @@ async def invoke_factual_finn_on_doubt(state: AgentState) -> dict:
     return {"finn_explanation": finn_response_to_doubt, "conversation_history": new_history_entries, "user_doubt": None}
 
 
-async def route_initial_or_doubt(state: AgentState) -> str:
-    # This function remains the same
-    print("---ROUTER: INITIAL_OR_DOUBT_ROUTER (Condition Function)---")
-    if state.get("user_doubt"): return "FACTUAL_FINN_ANSWER_DOUBT"
-    else: return "GENERATE_GUIDING_THEMES"
-
-
 MAX_CONVERSATION_TURNS = 3
 
-def route_after_evaluation(state: AgentState) -> str: # << RENAMED from route_after_finn_node
-    print(f"---ROUTER: route_after_evaluation (Current Turn: {state.get('current_turn', 0)}, User Doubt: {state.get('user_doubt') is not None})---")
+def route_after_evaluation(state: AgentState) -> str:
+    print(f"---ROUTER: route_after_evaluation (Turn: {state.get('current_turn', 0)}, User Doubt: {state.get('user_doubt') is not None})---")
+
+    # If a doubt was just answered, we continue the main flow.
+    # The 'user_doubt' field is cleared after being answered.
+    # This router is now the main controller for the conversation flow.
     if state.get("user_doubt"):
         print("User doubt detected. Routing to FACTUAL_FINN_ANSWER_DOUBT.")
         return "FACTUAL_FINN_ANSWER_DOUBT"
-    
+
     guiding_themes = state.get("guiding_themes")
     covered_themes = state.get("covered_themes")
+
     if guiding_themes and covered_themes is not None and len(covered_themes) >= len(guiding_themes):
         print("All guiding themes have been evaluated as covered. Ending conversation.")
         return END
@@ -209,40 +184,34 @@ def route_after_evaluation(state: AgentState) -> str: # << RENAMED from route_af
     if state.get("current_turn", 0) >= MAX_CONVERSATION_TURNS:
         print("Max AI-AI turns reached. Ending conversation.")
         return END
-    else:
-        print("Themes remaining. Continuing to Casey.")
-        return "CURIOUS_CASEY"
+
+    print("Themes remaining or no doubt present. Continuing to Casey.")
+    return "CURIOUS_CASEY"
 
 
 # --- Define the LangGraph Workflow ---
-print("Defining LangGraph workflow with Theme Coverage Evaluation...")
+print("Defining LangGraph workflow with EXPLICIT THEME INPUT...")
 workflow = StateGraph(AgentState)
 
 # Add nodes
-workflow.add_node("GENERATE_GUIDING_THEMES", generate_guiding_themes)
+# Note: "GENERATE_GUIDING_THEMES" node has been removed.
 workflow.add_node("CURIOUS_CASEY", invoke_curious_casey)
 workflow.add_node("FACTUAL_FINN_EXPLAIN", invoke_factual_finn_explain)
-workflow.add_node("EVALUATE_THEME_COVERAGE", evaluate_theme_coverage) # New node
+workflow.add_node("EVALUATE_THEME_COVERAGE", evaluate_theme_coverage)
 workflow.add_node("FACTUAL_FINN_ANSWER_DOUBT", invoke_factual_finn_on_doubt)
 
-# Entry point logic (remains the same)
-workflow.set_conditional_entry_point(
-    route_initial_or_doubt,
-    {
-        "GENERATE_GUIDING_THEMES": "GENERATE_GUIDING_THEMES",
-        "FACTUAL_FINN_ANSWER_DOUBT": "FACTUAL_FINN_ANSWER_DOUBT",
-    }
-)
+# The entry point is now always CURIOUS_CASEY.
+# The graph assumes themes are pre-populated in the state.
+workflow.set_entry_point("CURIOUS_CASEY")
 
 # Define edges
-workflow.add_edge("GENERATE_GUIDING_THEMES", "CURIOUS_CASEY")
 workflow.add_edge("CURIOUS_CASEY", "FACTUAL_FINN_EXPLAIN")
-workflow.add_edge("FACTUAL_FINN_EXPLAIN", "EVALUATE_THEME_COVERAGE") # << NEW EDGE
+workflow.add_edge("FACTUAL_FINN_EXPLAIN", "EVALUATE_THEME_COVERAGE")
 
 # Conditional routing AFTER theme coverage has been evaluated
 workflow.add_conditional_edges(
-    "EVALUATE_THEME_COVERAGE", # << SOURCE is now the evaluation node
-    route_after_evaluation,    # << Using the renamed router
+    "EVALUATE_THEME_COVERAGE",
+    route_after_evaluation,
     {
         "CURIOUS_CASEY": "CURIOUS_CASEY",
         "FACTUAL_FINN_ANSWER_DOUBT": "FACTUAL_FINN_ANSWER_DOUBT",
@@ -253,14 +222,18 @@ workflow.add_conditional_edges(
 # Conditional routing AFTER a doubt is answered
 workflow.add_conditional_edges(
     "FACTUAL_FINN_ANSWER_DOUBT",
-    route_after_evaluation, # << Using the renamed router
+    route_after_evaluation,
     {
         "CURIOUS_CASEY": "CURIOUS_CASEY",
         END: END
     }
 )
 
+
 # Compile the graph
 memory_saver = MemorySaver()
-app_graph = workflow.compile(checkpointer=memory_saver)
-print("LangGraph workflow compiled successfully with Theme Coverage Evaluation logic.")
+app_graph = workflow.compile(
+    checkpointer=memory_saver,
+    interrupt_after=["EVALUATE_THEME_COVERAGE"],
+)
+print("LangGraph workflow compiled with INTERRUPT trigger for human-in-the-loop.")

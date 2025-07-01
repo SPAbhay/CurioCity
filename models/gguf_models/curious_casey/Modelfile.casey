@@ -8,6 +8,6 @@ TEMPLATE """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 PARAMETER stop "<|eot_id|>"
 PARAMETER stop "<|end_of_text|>"
 PARAMETER stop "The knowledgeable AI just said:"
-PARAMETER stop "\n\n" 
+# PARAMETER stop "\n\n" 
 PARAMETER num_predict 150 
 PARAMETER temperature 0.7
