@@ -32,7 +32,7 @@ load_dotenv()
 # --- Configuration ---
 OLLAMA_FACTUAL_FINN_MODEL_NAME = "factual-finn"
 OLLAMA_CURIOUS_CASEY_MODEL_NAME = "curious-casey"
-OLLAMA_GENERAL_MODEL_NAME = os.getenv("OLLAMA_GENERAL_MODEL", "llama3.1") # New: General purpose model
+OLLAMA_GENERAL_MODEL_NAME = os.getenv("OLLAMA_GENERAL_MODEL", "llama3.1")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # (Voice ID and Audio Dir constants remain the same)
@@ -58,7 +58,7 @@ alpaca_prompt_template_str = """Below is an instruction that describes a task, p
 # --- Global LLM clients ---
 factual_finn_llm = None
 curious_casey_llm = None
-general_llm = None # New: General purpose client
+general_llm = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -81,7 +81,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Error initializing Curious Casey ChatOllama client: {e}\n{traceback.format_exc()}")
 
-    # <<<< NEW: Initialize General Purpose LLM >>>>
+    # Initialize General Purpose LLM
     print(f"Initializing ChatOllama for General Use: {OLLAMA_GENERAL_MODEL_NAME}...")
     try:
         general_llm = ChatOllama(model=OLLAMA_GENERAL_MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0)
@@ -102,23 +102,20 @@ origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
-# --- Pydantic Models (remain the same) ---
+# --- Pydantic Models ---
 class ProposeThemesResponse(BaseModel):
     thread_id: str
     themes: List[str]
 
-# NEW: For the request to the new theme proposal endpoint
 class ProposeThemesRequest(BaseModel):
-    initial_information: str
     user_provided_themes: Optional[List[str]] = None
-    doc_id: str # We need the doc_id here to associate with the thread
+    doc_id: str
 
-# MODIFIED: This request now starts a flow that has already been prepared
 class StartPodcastRequest(BaseModel):
     final_themes: List[str]
     doc_id: str
-    initial_information: str
     generate_audio: bool = False
+    generation_mode: str
 
 class PodcastFlowResponse(BaseModel):
     thread_id: str
@@ -137,7 +134,7 @@ class FollowUpRequest(BaseModel):
     previous_statement: str
 
 class GenerateThemesRequest(BaseModel):
-    topic_info: str 
+    topic_info: str
 
 class GuidingThemesOutput(BaseModel):
     themes: List[str] = Field(description="A list of 3 to 4 key open-ended questions or themes for the podcast.")
@@ -151,8 +148,46 @@ class CoverageEvaluationOutput(BaseModel):
     is_covered: bool = Field(description="Set to true if the theme was adequately covered, false otherwise.")
     reasoning: str = Field(description="A brief explanation for why the theme was or was not considered covered.")
 
+class ProcessTextRequest(BaseModel):
+    doc_id: str
+    text_content: str
+
+class DocumentProcessedResponse(BaseModel):
+    message: str
+    doc_id: str
+    topic_summary: str
+
+# --- Helper Functions ---
+
+async def _summarize_text_for_topic(text_content: str) -> str:
+    if not general_llm:
+        return "Summary not available."
+    
+    prompt = (
+        "You are an expert at summarizing content. "
+        "Based on the following excerpt from a document, please generate a concise, one-sentence topic summary suitable for a podcast title. "
+        "Your response should contain ONLY the summary text and nothing else. Do not include any preamble.\n\n"
+        f"EXCERPT:\n'''\n{text_content[:2000]}\n'''\n\n"
+        "CONCISE TOPIC SUMMARY:"
+    )
+    try:
+        response = await general_llm.ainvoke(prompt)
+        
+        raw_summary = response.content.strip()
+        if ':' in raw_summary:
+            summary = raw_summary.split(':', 1)[-1].strip()
+        else:
+            summary = raw_summary
+        summary = summary.replace('"', '')
+        
+        print(f"Generated topic summary: {summary}")
+        return summary
+    except Exception as e:
+        print(f"Error during topic summarization: {e}")
+        return "Could not determine topic automatically."
+
+
 async def _generate_podcast_audio(conversation_history: list, request_timestamp: int, filename_prefix: str) -> Optional[str]:
-    # (This function is complete and does not need changes)
     generated_audio_segments_paths = []; final_podcast_filename_only = None
     if not conversation_history: return None
     for i, turn_text in enumerate(conversation_history):
@@ -187,7 +222,7 @@ async def _generate_podcast_audio(conversation_history: list, request_timestamp:
 async def root():
     finn_status = "Ready" if factual_finn_llm else "Failed"
     casey_status = "Ready" if curious_casey_llm else "Failed"
-    general_status = "Ready" if general_llm else "Failed" # Added general status
+    general_status = "Ready" if general_llm else "Failed"
     graph_status = "Ready" if app_graph else "Failed"
     return {
         "message": "AI Podcast Backend is running!",
@@ -197,9 +232,45 @@ async def root():
         "langgraph_status": graph_status
     }
 
-@app.post("/process_document_for_rag")
+@app.post("/process_text_for_rag", response_model=DocumentProcessedResponse)
+async def process_text_for_rag_endpoint(request: ProcessTextRequest):
+    if not request.text_content.strip():
+        raise HTTPException(status_code=400, detail="No text content provided.")
+    
+    success = await run_in_threadpool(create_vector_store_from_text, request.doc_id, request.text_content)
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Failed to create vector store for doc_id: {request.doc_id}")
+
+    topic_summary = await _summarize_text_for_topic(request.text_content)
+    
+    config = {"configurable": {"thread_id": request.doc_id}}
+    initial_graph_input = AgentState(
+        initial_user_input=topic_summary,
+        doc_id=request.doc_id,
+        guiding_themes=[],
+        covered_themes=[],
+        casey_question="",
+        finn_explanation="",
+        conversation_history=[],
+        current_turn=0,
+        generated_audio_file=None,
+        user_doubt=None,
+        current_targeted_theme=None,
+        generation_mode="interactive",
+        turns_on_current_theme=0,
+        target_turns_for_theme=0
+    )
+    app_graph.update_state(config, initial_graph_input)
+
+    return DocumentProcessedResponse(
+        message=f"Text content processed for doc_id: {request.doc_id}",
+        doc_id=request.doc_id,
+        topic_summary=topic_summary
+    )
+
+
+@app.post("/process_document_for_rag", response_model=DocumentProcessedResponse)
 async def process_document_for_rag_endpoint(doc_id: str = Form(...), file: UploadFile = File(...)):
-    # ... (This endpoint remains the same)
     if not file.filename.endswith(".pdf"): raise HTTPException(status_code=400, detail="Invalid file type.")
     text_content, tmp_file_path = "", ""
     try:
@@ -209,13 +280,40 @@ async def process_document_for_rag_endpoint(doc_id: str = Form(...), file: Uploa
     finally:
         if os.path.exists(tmp_file_path): os.remove(tmp_file_path)
     if not text_content.strip(): raise HTTPException(status_code=400, detail="No text content extracted from PDF.")
+    
     success = await run_in_threadpool(create_vector_store_from_text, doc_id, text_content)
-    if success: return {"message": f"Document '{file.filename}' processed for doc_id: {doc_id}"}
-    else: raise HTTPException(status_code=500, detail=f"Failed to create vector store for doc_id: {doc_id}")
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Failed to create vector store for doc_id: {doc_id}")
+
+    topic_summary = await _summarize_text_for_topic(text_content)
+    
+    config = {"configurable": {"thread_id": doc_id}}
+    initial_graph_input = AgentState(
+        initial_user_input=topic_summary,
+        doc_id=doc_id,
+        guiding_themes=[],
+        covered_themes=[],
+        casey_question="",
+        finn_explanation="",
+        conversation_history=[],
+        current_turn=0,
+        generated_audio_file=None,
+        user_doubt=None,
+        current_targeted_theme=None,
+        generation_mode="interactive",
+        turns_on_current_theme=0,
+        target_turns_for_theme=0
+    )
+    app_graph.update_state(config, initial_graph_input)
+
+    return DocumentProcessedResponse(
+        message=f"Document '{file.filename}' processed for doc_id: {doc_id}",
+        doc_id=doc_id,
+        topic_summary=topic_summary
+    )
 
 @app.post("/explain", response_model=dict)
 async def get_explanation_from_finn_model(request: ExplanationRequest):
-    # (Reverting retriever call to the robust version, simplifying prompt)
     if not factual_finn_llm: raise HTTPException(status_code=503, detail="Factual Finn (Ollama) service not initialized.")
     retriever = get_retriever_for_doc(request.doc_id)
     if not retriever: raise HTTPException(status_code=404, detail=f"No document found for doc_id: {request.doc_id}.")
@@ -229,17 +327,16 @@ async def get_explanation_from_finn_model(request: ExplanationRequest):
     final_input_text_for_finn = f"Context to use for the answer:\n'''\n{retrieved_context}\n'''"
     prompt_to_ollama = alpaca_prompt_template_str.format(instruction=final_instruction_for_finn, input_text=final_input_text_for_finn)
     try:
-        response = await factual_finn_llm.ainvoke(prompt_to_ollama)
+        response = await factual_finn_llm.ainvoke(prompt_to_ollama, stop=["### Instruction:"])
         return {"explanation": response.content.strip()}
     except Exception as e: print(f"Error in /explain endpoint (Ollama call): {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail=f"Error generating RAG explanation: {str(e)}")
 
 @app.post("/ask_follow_up", response_model=dict)
-async def get_question_from_casey_model(request: FollowUpRequest): # This endpoint remains the same
-    # ... your working /ask_follow_up endpoint code ...
+async def get_question_from_casey_model(request: FollowUpRequest):
     if not curious_casey_llm: raise HTTPException(status_code=503, detail="Curious Casey (Ollama) service not initialized.")
     try:
         casey_direct_input = f"The knowledgeable AI just said: '{request.previous_statement}'"
-        response = await curious_casey_llm.ainvoke(casey_direct_input)
+        response = await curious_casey_llm.ainvoke(casey_direct_input, stop=["The knowledgeable AI just said:"])
         return {"follow_up_question": response.content.strip()}
     except Exception as e: print(f"Error in /ask_follow_up endpoint: {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail=f"Error generating question: {str(e)}")
 
@@ -267,16 +364,9 @@ async def generate_themes_endpoint(request: GenerateThemesRequest):
     try:
         prompt_value = await theme_prompt_template.ainvoke({"topic_info": request.topic_info})
         response = await chain.ainvoke({"topic_info": request.topic_info})
-
-        # The parser returns a Pydantic *object*, not a dict. Let's name it appropriately.
         parsed_output = await retry_parser.aparse_with_prompt(response.content, prompt_value)
-        
-        # Access the 'themes' attribute directly on the object.
         print(f"Generated and parsed themes: {parsed_output.themes}")
-        
-        # Return the Pydantic object. FastAPI will automatically convert it to JSON.
         return parsed_output
-        
     except Exception as e:
         print(f"Error in /generate_themes endpoint (LLM call or parsing): {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error generating or parsing themes: {str(e)}")
@@ -312,103 +402,85 @@ async def evaluate_coverage_endpoint(request: CoverageEvaluationRequest):
             "question": request.question,
             "answer": request.answer
         }
-        
         prompt_value = await evaluation_prompt_template.ainvoke(input_data)
         response = await chain.ainvoke(input_data)
-
-        # This returns a CoverageEvaluationOutput object
         evaluation_result = await retry_parser.aparse_with_prompt(response.content, prompt_value)
-        
         print(f"Coverage evaluation result: {evaluation_result}")
-        
-        # We return the object, and FastAPI serializes it based on the response_model
-        return evaluation_result 
+        return evaluation_result
     except Exception as e:
         print(f"Error during coverage evaluation LLM call or parsing: {e}\n{traceback.format_exc()}")
-        # This fallback needs to return a valid object matching the Pydantic model
         return CoverageEvaluationOutput(
-            is_covered=False, 
+            is_covered=False,
             reasoning=f"Failed to evaluate due to an error: {str(e)}"
         )
 
 @app.post("/propose_themes", response_model=ProposeThemesResponse)
 async def propose_themes_endpoint(request: ProposeThemesRequest):
-    """
-    Generates a thread_id and proposes guiding themes for a new podcast.
-    It does NOT start the graph execution.
-    """
-    thread_id = str(uuid.uuid4())
-    print(f"Proposing themes for new thread_id: {thread_id}")
+    thread_id = request.doc_id
+    print(f"Proposing themes for thread_id: {thread_id}")
+    
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    # MODIFIED: Removed 'await' as get_state is a synchronous method.
+    current_state_snapshot = app_graph.get_state(config)
+    
+    topic_summary = current_state_snapshot.values.get("initial_user_input", "No topic summary found.")
     
     themes = []
     if request.user_provided_themes:
         print(f"Using user-provided themes: {request.user_provided_themes}")
         themes = request.user_provided_themes
     else:
-        print("No user themes provided, generating themes with AI...")
+        print(f"No user themes provided, generating themes with AI based on topic: '{topic_summary}'")
         try:
-            # We can call our existing theme generation endpoint internally
             generated_themes_output = await generate_themes_endpoint(
-                GenerateThemesRequest(topic_info=request.initial_information)
+                GenerateThemesRequest(topic_info=topic_summary)
             )
             themes = generated_themes_output.themes
         except Exception as e:
             print(f"Error generating themes: {e}")
             raise HTTPException(status_code=500, detail="Failed to generate guiding themes.")
     
-    # Here we will pre-populate the initial state for the thread.
-    # This is important so that when we start the flow later, the context is not lost.
-    initial_graph_input = AgentState(
-        initial_user_input=request.initial_information,
-        doc_id=request.doc_id,
-        guiding_themes=themes, # Using the approved themes
-        covered_themes=[],
-        casey_question="",
-        finn_explanation="",
-        conversation_history=[],
-        current_turn=0,
-        generated_audio_file=None,
-        user_doubt=None,
-        current_targeted_theme=None
-    )
-    config = {"configurable": {"thread_id": thread_id}}
-    # We update the state in the checkpointer without running the graph
-    app_graph.update_state(config, initial_graph_input)
-    print(f"Initial state saved for thread_id: {thread_id}")
+    app_graph.update_state(config, {"guiding_themes": themes})
+    print(f"Themes saved for thread_id: {thread_id}")
 
     return ProposeThemesResponse(thread_id=thread_id, themes=themes)
 
 @app.post("/initiate_podcast_flow/{thread_id}", response_model=AgentState)
 async def initiate_podcast_flow_endpoint(thread_id: str, request: StartPodcastRequest):
-    """
-    Starts the graph execution for a pre-configured thread_id with user-approved themes.
-    """
     if not app_graph:
         raise HTTPException(status_code=500, detail="LangGraph application not initialized.")
     
-    print(f"--- Initiating podcast flow for thread_id: {thread_id} ---")
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
+    print(f"--- Initiating podcast flow for thread_id: {thread_id} (Mode: {request.generation_mode}) ---")
+    config = {"configurable": {"thread_id": thread_id}}
     
-    # The initial state is already in the checkpointer.
-    # We just need to update it with the final, user-approved themes.
-    state_update = {"guiding_themes": request.final_themes}
+    state_update = {
+        "guiding_themes": request.final_themes,
+        "generation_mode": request.generation_mode
+    }
     app_graph.update_state(config, state_update)
 
     try:
-        # We invoke with None because the state is already saved. The graph will start from its entry point.
         final_state_dict = await app_graph.ainvoke(None, config=config)
         
-        print(f"LangGraph flow initiated and paused for {thread_id}. Turns: {final_state_dict.get('current_turn')}")
-        
-        # Audio generation logic can remain for when we add a "Bulk Mode"
+        if request.generation_mode == "bulk":
+            print("Bulk mode detected. Running graph to completion...")
+            while len(final_state_dict.get("covered_themes", [])) < len(final_state_dict.get("guiding_themes", [])):
+                print(f"Bulk mode: Continuing... (Covered {len(final_state_dict.get('covered_themes', []))}/{len(final_state_dict.get('guiding_themes', []))})")
+                final_state_dict = await app_graph.ainvoke(None, config=config)
+                if final_state_dict.get("current_turn", 0) > 15:
+                    print("Bulk mode safety break triggered after 15 turns.")
+                    break
+            print("Bulk mode run complete.")
+
         if request.generate_audio:
             request_timestamp = int(time.time())
             final_state_dict["generated_audio_file"] = await _generate_podcast_audio(final_state_dict.get("conversation_history", []), request_timestamp, "podcast_initiate")
         else:
             final_state_dict["generated_audio_file"] = None
         
-        # The response model is now just AgentState directly
         return final_state_dict
+        
     except Exception as e:
         print(f"Error in /initiate_podcast_flow endpoint: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error in podcast flow execution: {str(e)}")
@@ -433,34 +505,24 @@ async def submit_doubt_endpoint(thread_id: str, request: SubmitDoubtRequest):
     
 @app.post("/continue_flow/{thread_id}", response_model=AgentState)
 async def continue_podcast_flow_endpoint(thread_id: str):
-    """
-    Resumes a paused graph execution for the given thread_id.
-    """
     if not app_graph:
         raise HTTPException(status_code=500, detail="LangGraph app not initialized.")
     
     print(f"--- Resuming podcast flow for thread_id: {thread_id} ---")
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
+    config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        # Calling ainvoke with None input on a thread that is paused
-        # will resume it from where it left off.
         final_state_dict = await app_graph.ainvoke(None, config=config)
-        
         print(f"Graph resumed and paused again for {thread_id}. Current turns: {final_state_dict.get('current_turn')}")
-        
-        # We won't generate audio here, we'll do that at the very end.
         final_state_dict["generated_audio_file"] = None
-        
         return final_state_dict
 
     except Exception as e:
         print(f"Error resuming flow for thread_id {thread_id}: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error resuming podcast flow: {str(e)}")    
+        raise HTTPException(status_code=500, detail=f"Error resuming podcast flow: {str(e)}")
 
 @app.get("/get_podcast_audio/{filename}")
 async def get_podcast_audio(filename: str):
-    file_path = os.path.join(AUDIO_OUTPUT_DIR, filename); 
+    file_path = os.path.join(AUDIO_OUTPUT_DIR, filename);
     if os.path.exists(file_path): return FileResponse(file_path, media_type='audio/mpeg', filename=filename)
     else: raise HTTPException(status_code=404, detail="Audio file not found.")
-
