@@ -1,4 +1,4 @@
-from typing import List, Annotated, Optional
+from typing import List, Annotated, Optional, Dict
 from typing_extensions import TypedDict
 import operator
 import httpx
@@ -14,7 +14,7 @@ class AgentState(TypedDict):
     finn_explanation: str
     conversation_history: Annotated[List[str], operator.add]
     current_turn: int
-    generated_audio_file: Optional[str]
+    final_podcast_file: Optional[str]
     user_doubt: Optional[str] 
     doc_id: Optional[str]
     guiding_themes: Optional[List[str]]
@@ -23,11 +23,16 @@ class AgentState(TypedDict):
     generation_mode: str 
     turns_on_current_theme: int
     target_turns_for_theme: int 
+    # NEW: A dictionary to map turn index to audio filename. This will be REPLACED on update.
+    audio_log: Dict[int, str]
 
 BACKEND_API_BASE_URL = os.getenv("BACKEND_API_URL", "http://127.0.0.1:8000")
 TURNS_PER_THEME_RANGE = (1, 3) 
 
 # --- Node Functions ---
+# Note: None of the node functions need to be changed. They will continue to
+# append clean text to `conversation_history` as before.
+
 async def invoke_curious_casey(state: AgentState) -> dict:
     print("---NODE: CURIOUS_CASEY---")
     current_turn = state.get("current_turn", 0)
@@ -41,12 +46,9 @@ async def invoke_curious_casey(state: AgentState) -> dict:
     if not context_for_casey_prompt:
         return {"casey_question": "Error: Missing context.", "current_targeted_theme": current_targeted_theme, "turns_on_current_theme": turns_on_current_theme, "target_turns_for_theme": target_turns_for_theme}
     
-    # --- MODIFIED LOGIC: Decide whether to start a new theme or ask a follow-up ---
-    
     if not current_targeted_theme:
         next_theme_to_ask_about = next((theme for theme in guiding_themes if theme not in covered_themes), None)
         if next_theme_to_ask_about:
-            # 4. NEW: When starting a new theme, randomly decide its length
             target_turns_for_theme = random.randint(*TURNS_PER_THEME_RANGE)
             print(f"Casey starting NEW theme: '{next_theme_to_ask_about}' (Targeting {target_turns_for_theme} turns)")
             api_payload_statement = (
@@ -133,7 +135,6 @@ async def evaluate_theme_coverage(state: AgentState) -> dict:
     updated_covered_themes = list(covered_themes)
     next_targeted_theme = current_targeted_theme
 
-    # 5. NEW: Check against the randomly set target for the current theme
     if current_targeted_theme and turns_on_current_theme >= target_turns_for_theme:
         print(f"Theme '{current_targeted_theme}' has been discussed for {turns_on_current_theme}/{target_turns_for_theme} turns and is now marked as covered.")
         if current_targeted_theme not in updated_covered_themes:

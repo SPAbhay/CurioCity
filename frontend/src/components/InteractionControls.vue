@@ -33,7 +33,6 @@ const handleSubmitDoubt = async () => {
 
   const payload = {
     user_doubt_text: userDoubtText.value,
-    generate_audio: true // Always generate audio for doubt responses for now
   };
 
   try {
@@ -57,12 +56,12 @@ const handleSubmitDoubt = async () => {
 <template>
   <div class="interaction-controls" v-if="isPodcastActive">
     <h3>Ask a Doubt</h3>
-    <p>Heard something you want to clarify? Type your question below to interrupt the podcast.</p>
+    <p>Have a question or need clarification? Type your doubt below to ask during the podcast.</p>
     <form @submit.prevent="handleSubmitDoubt" class="doubt-form">
       <input
         type="text"
         v-model="userDoubtText"
-        placeholder="e.g., What did you mean by 'spacetime curvature'?"
+        placeholder="e.g., Could you explain what 'spacetime curvature' means?"
         :disabled="isLoading"
       />
       <button type="submit" :disabled="isLoading">

@@ -3,26 +3,33 @@ import { ref, computed } from 'vue';
 import axios from 'axios';
 import SetupForm from './components/SetupForm.vue';
 import PodcastDisplay from './components/PodcastDisplay.vue';
-import AudioControls from './components/AudioControls.vue';
 import InteractionControls from './components/InteractionControls.vue';
-import ThemeTracker from './components/ThemeTracker.vue'; // 1. Import the new component
+import ThemeTracker from './components/ThemeTracker.vue';
 
 // --- State Management ---
 const currentPodcastState = ref(null);
 const currentThreadId = ref(null);
 const currentDocId = ref(null);
 const isLoading = ref(false);
+const isDownloading = ref(false);
 const generationMode = ref(null);
 
 // --- Computed Properties for Child Components ---
 const conversationLog = computed(() => currentPodcastState.value?.conversation_history || []);
-const generatedAudioFile = computed(() => currentPodcastState.value?.generated_audio_file || null);
+// NEW: Computed property for the audio log
+const audioLog = computed(() => currentPodcastState.value?.audio_log || {});
 const isPodcastActive = computed(() => currentThreadId.value !== null);
-
-// NEW: Computed properties to pass to the ThemeTracker
 const guidingThemes = computed(() => currentPodcastState.value?.guiding_themes || []);
 const coveredThemes = computed(() => currentPodcastState.value?.covered_themes || []);
 
+const isPodcastFinished = computed(() => {
+  if (!currentPodcastState.value?.guiding_themes || !isPodcastActive.value) {
+    return false;
+  }
+  const guiding = currentPodcastState.value.guiding_themes;
+  const covered = currentPodcastState.value.covered_themes;
+  return guiding.length > 0 && guiding.length === covered.length;
+});
 
 // --- Event Handlers ---
 const handleDocumentProcessed = (docId) => {
@@ -47,25 +54,55 @@ const handleNewDoubtResponse = (updatedState) => {
 const handleDoubtError = (errorMessage) => {
   console.error("App.vue: Received 'doubt-submission-error' event:", errorMessage);
   alert(`Error submitting your doubt: ${errorMessage}`);
-}
+};
 
 const handleContinue = async () => {
-    if (!currentThreadId.value) {
-        console.error("Cannot continue, threadId is missing.");
-        return;
+  if (!currentThreadId.value) {
+    console.error("Cannot continue, threadId is missing.");
+    return;
+  }
+  isLoading.value = true;
+  try {
+    const response = await axios.post(`http://127.0.0.1:8000/continue_flow/${currentThreadId.value}`);
+    const newState = response.data;
+    console.log("App.vue: Received new state after continue", newState);
+    currentPodcastState.value = newState;
+  } catch (error) {
+    console.error("Error calling continue API:", error);
+    alert(`Failed to get next turn: ${error.response?.data?.detail || error.message}`);
+  } finally {
+    isLoading.value = false;
+  }
+};
+
+const handleDownloadFullPodcast = async () => {
+  if (!currentThreadId.value) {
+    alert("Error: No podcast session ID found.");
+    return;
+  }
+  isDownloading.value = true;
+  try {
+    const createResponse = await axios.post(`http://127.0.0.1:8000/create_full_podcast/${currentThreadId.value}`);
+    const finalFilename = createResponse.data.final_podcast_file;
+
+    if (!finalFilename) {
+      throw new Error("Backend did not provide a final audio file name.");
     }
-    isLoading.value = true;
-    try {
-        const response = await axios.post(`http://127.0.0.1:8000/continue_flow/${currentThreadId.value}`);
-        const newState = response.data;
-        console.log("App.vue: Received new state after continue", newState);
-        currentPodcastState.value = newState;
-    } catch (error) {
-        console.error("Error calling continue API:", error);
-        alert(`Failed to get next turn: ${error.response?.data?.detail || error.message}`);
-    } finally {
-        isLoading.value = false;
-    }
+
+    const downloadUrl = `http://127.0.0.1:8000/get_podcast_audio/${finalFilename}`;
+    const link = document.createElement('a');
+    link.href = downloadUrl;
+    link.setAttribute('download', finalFilename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+  } catch (error) {
+    console.error("Error creating or downloading full podcast:", error);
+    alert(`Failed to download the full podcast: ${error.response?.data?.detail || error.message}`);
+  } finally {
+    isDownloading.value = false;
+  }
 };
 </script>
 
@@ -75,34 +112,37 @@ const handleContinue = async () => {
       <h1>GenAI Podcast Studio</h1>
       <p class="subtitle">Upload a document, define a topic, and listen to AI hosts discuss its contents.</p>
     </header>
-    
-    <SetupForm 
+
+    <SetupForm
       @document-processed="handleDocumentProcessed"
-      @podcast-generated="handlePodcastGenerated" 
+      @podcast-generated="handlePodcastGenerated"
     />
 
-    <!-- 2. Add the new component here -->
     <ThemeTracker
       v-if="isPodcastActive"
       :guiding-themes="guidingThemes"
       :covered-themes="coveredThemes"
     />
-    
-    <PodcastDisplay :conversationHistory="conversationLog" />
 
-    <div class="controls" v-if="currentPodcastState && currentPodcastState.current_turn > 0 && generationMode === 'interactive'">
-        <button @click="handleContinue" :disabled="isLoading">
-            {{ isLoading ? 'Generating...' : 'Next Turn' }}
-        </button>
-    </div>
-
-    <AudioControls 
-        v-if="generatedAudioFile" 
-        :audioFileName="generatedAudioFile" 
+    <PodcastDisplay
+      :conversationHistory="conversationLog"
+      :audioLog="audioLog"
     />
 
-    <InteractionControls 
-      v-if="isPodcastActive && conversationLog.length > 0 && generationMode === 'interactive'"
+    <div class="controls" v-if="isPodcastActive && !isPodcastFinished && generationMode === 'interactive'">
+      <button @click="handleContinue" :disabled="isLoading">
+        {{ isLoading ? 'Generating...' : 'Next Turn' }}
+      </button>
+    </div>
+
+    <div class="controls" v-if="isPodcastFinished">
+      <button @click="handleDownloadFullPodcast" :disabled="isDownloading">
+        {{ isDownloading ? 'Preparing Download...' : 'Download Full Podcast' }}
+      </button>
+    </div>
+
+    <InteractionControls
+      v-if="isPodcastActive && !isPodcastFinished && generationMode === 'interactive'"
       :isPodcastActive="isPodcastActive"
       :threadId="currentThreadId"
       :docId="currentDocId"
@@ -141,20 +181,20 @@ h1 {
   margin: 20px 0;
 }
 .controls button {
-    padding: 10px 25px;
-    font-size: 1.1em;
-    cursor: pointer;
-    background-color: #007bff;
-    color: white;
-    border: none;
-    border-radius: 5px;
-    transition: background-color 0.2s;
+  padding: 10px 25px;
+  font-size: 1.1em;
+  cursor: pointer;
+  background-color: #007bff;
+  color: white;
+  border: none;
+  border-radius: 5px;
+  transition: background-color 0.2s;
 }
 .controls button:hover:not(:disabled) {
-    background-color: #0056b3;
+  background-color: #0056b3;
 }
 .controls button:disabled {
-    background-color: #555;
-    cursor: not-allowed;
+  background-color: #555;
+  cursor: not-allowed;
 }
 </style>

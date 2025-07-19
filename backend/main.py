@@ -6,8 +6,9 @@ import os
 import uuid
 import time
 import traceback
+import re
 
-from typing import Optional, List
+from typing import Optional, List, Dict
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain.output_parsers.retry import RetryWithErrorOutputParser
 from langchain_core.prompts import PromptTemplate
@@ -17,7 +18,7 @@ from graph_orchestrator import app_graph, AgentState
 from dotenv import load_dotenv
 
 from fastapi.responses import FileResponse
-from tts_utils import text_to_speech_elevenlabs_async as text_to_speech_file
+from tts_utils import text_to_speech_elevenlabs_async
 from pydub import AudioSegment
 
 from fastapi import File, UploadFile, Form
@@ -29,13 +30,12 @@ import tempfile
 
 load_dotenv()
 
-# --- Configuration ---
+# --- Configuration (remains the same) ---
 OLLAMA_FACTUAL_FINN_MODEL_NAME = "factual-finn"
 OLLAMA_CURIOUS_CASEY_MODEL_NAME = "curious-casey"
 OLLAMA_GENERAL_MODEL_NAME = os.getenv("OLLAMA_GENERAL_MODEL", "llama3.1")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-# (Voice ID and Audio Dir constants remain the same)
 CASEY_VOICE_ID = os.getenv("CASEY_VOICE_ID", "F2OOWcJMWhX8wCsyT0oR")
 FINN_VOICE_ID = os.getenv("FINN_VOICE_ID", "IFEvkitzF8OoHeggkJUu")
 NARRATOR_VOICE_ID = os.getenv("NARRATOR_VOICE_ID", CASEY_VOICE_ID)
@@ -55,11 +55,12 @@ alpaca_prompt_template_str = """Below is an instruction that describes a task, p
 ### Response:
 """
 
-# --- Global LLM clients ---
+# --- Global LLM clients (remains the same) ---
 factual_finn_llm = None
 curious_casey_llm = None
 general_llm = None
 
+# --- Lifespan function (remains the same) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global factual_finn_llm, curious_casey_llm, general_llm, app_graph
@@ -102,7 +103,7 @@ origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
-# --- Pydantic Models ---
+# --- Pydantic Models (remain the same) ---
 class ProposeThemesResponse(BaseModel):
     thread_id: str
     themes: List[str]
@@ -123,7 +124,9 @@ class PodcastFlowResponse(BaseModel):
 
 class SubmitDoubtRequest(BaseModel):
     user_doubt_text: str
-    generate_audio: bool = False
+
+class CreateFullPodcastResponse(BaseModel):
+    final_podcast_file: Optional[str]
 
 class ExplanationRequest(BaseModel):
     instruction: str
@@ -160,6 +163,7 @@ class DocumentProcessedResponse(BaseModel):
 # --- Helper Functions ---
 
 async def _summarize_text_for_topic(text_content: str) -> str:
+    # This function remains the same
     if not general_llm:
         return "Summary not available."
     
@@ -187,39 +191,109 @@ async def _summarize_text_for_topic(text_content: str) -> str:
         return "Could not determine topic automatically."
 
 
-async def _generate_podcast_audio(conversation_history: list, request_timestamp: int, filename_prefix: str) -> Optional[str]:
-    generated_audio_segments_paths = []; final_podcast_filename_only = None
-    if not conversation_history: return None
-    for i, turn_text in enumerate(conversation_history):
-        speaker_label, text_to_speak, current_voice_id, current_model_id = "", "", "", ""
-        if turn_text.startswith("Curious Casey:"): speaker_label, text_to_speak, current_voice_id, current_model_id = "Casey", turn_text.replace("Curious Casey: ", "", 1).strip(), CASEY_VOICE_ID, CASEY_TTS_MODEL_ID
-        elif turn_text.startswith("Factual Finn (addressing doubt):"): speaker_label, text_to_speak, current_voice_id, current_model_id = "Finn_Doubt", turn_text.replace("Factual Finn (addressing doubt): ", "", 1).strip(), FINN_VOICE_ID, FINN_TTS_MODEL_ID
-        elif turn_text.startswith("Factual Finn:"): speaker_label, text_to_speak, current_voice_id, current_model_id = "Finn", turn_text.replace("Factual Finn: ", "", 1).strip(), FINN_VOICE_ID, FINN_TTS_MODEL_ID
-        elif turn_text.startswith("Initial Topic:"): speaker_label, text_to_speak, current_voice_id, current_model_id = "Narrator", turn_text.replace("Initial Topic: ", "", 1).strip(), NARRATOR_VOICE_ID, NARRATOR_TTS_MODEL_ID
-        elif turn_text.startswith("User Doubt:"): continue
-        else: continue
-        if not text_to_speak: continue
-        segment_filename_base = f"segment_{request_timestamp}_{i}_{speaker_label}"
-        segment_filename = await text_to_speech_file(text=text_to_speak, output_filename_base=segment_filename_base, output_dir=AUDIO_OUTPUT_DIR, voice_id=current_voice_id, model_id=current_model_id)
-        if segment_filename: generated_audio_segments_paths.append(os.path.join(AUDIO_OUTPUT_DIR, segment_filename))
-    if generated_audio_segments_paths:
-        combined_audio = AudioSegment.empty()
-        for segment_path in generated_audio_segments_paths:
-            if os.path.exists(segment_path):
-                try: combined_audio += AudioSegment.from_mp3(segment_path)
-                except Exception as e: print(f"Error loading segment {segment_path}: {e}")
-            else: print(f"Audio segment file not found, skipping: {segment_path}")
-        if len(combined_audio) > 0:
-            final_podcast_filename_only = f"{filename_prefix}_{request_timestamp}.mp3"
-            final_podcast_full_path = os.path.join(AUDIO_OUTPUT_DIR, final_podcast_filename_only)
-            try: combined_audio.export(final_podcast_full_path, format="mp3"); return final_podcast_filename_only
-            except Exception as e: print(f"Error exporting combined audio: {e}\n{traceback.format_exc()}")
+async def _generate_audio_for_turn(turn_text: str, turn_index: int) -> Optional[str]:
+    # This function is correct and remains the same
+    speaker_label, text_to_speak, current_voice_id, current_model_id = "", "", "", ""
+
+    if turn_text.startswith("Curious Casey:"):
+        speaker_label, text_to_speak = "Casey", turn_text.replace("Curious Casey: ", "", 1).strip()
+        current_voice_id, current_model_id = CASEY_VOICE_ID, CASEY_TTS_MODEL_ID
+    elif turn_text.startswith("Factual Finn (addressing doubt):"):
+        speaker_label, text_to_speak = "Finn_Doubt", turn_text.replace("Factual Finn (addressing doubt): ", "", 1).strip()
+        current_voice_id, current_model_id = FINN_VOICE_ID, FINN_TTS_MODEL_ID
+    elif turn_text.startswith("Factual Finn:"):
+        speaker_label, text_to_speak = "Finn", turn_text.replace("Factual Finn: ", "", 1).strip()
+        current_voice_id, current_model_id = FINN_VOICE_ID, FINN_TTS_MODEL_ID
+    elif turn_text.startswith("Initial Topic:"):
+        speaker_label, text_to_speak = "Narrator", turn_text.replace("Initial Topic: ", "", 1).strip()
+        current_voice_id, current_model_id = NARRATOR_VOICE_ID, NARRATOR_TTS_MODEL_ID
+    else:
+        return None
+
+    if not text_to_speak:
+        return None
+
+    segment_filename_base = f"segment_{int(time.time())}_{turn_index}_{speaker_label}"
+    audio_filename = await text_to_speech_elevenlabs_async(
+        text=text_to_speak,
+        output_filename_base=segment_filename_base,
+        output_dir=AUDIO_OUTPUT_DIR,
+        voice_id=current_voice_id,
+        model_id=current_model_id
+    )
+    return audio_filename
+
+
+# REWRITTEN: This function now uses the new `audio_log` field to avoid the duplication bug.
+async def _generate_audio_and_update_log(state_dict: dict, thread_id: str) -> dict:
+    """
+    Generates audio for any new turns and updates the `audio_log` in the state.
+    This log is replaced on each update, which is the key to fixing the bug.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    history = state_dict.get("conversation_history", [])
+    # Get the existing log or start a new one
+    current_audio_log = state_dict.get("audio_log", {})
+    
+    log_was_updated = False
+    # Use a copy to avoid modifying the dictionary while iterating
+    new_audio_log = current_audio_log.copy()
+
+    for i, turn in enumerate(history):
+        # If we haven't already processed this turn number, generate audio
+        if i not in new_audio_log:
+            audio_filename = await _generate_audio_for_turn(turn, i)
+            if audio_filename:
+                print(f"Generated audio for turn {i}: {audio_filename}")
+                new_audio_log[i] = audio_filename
+                log_was_updated = True
+
+    if log_was_updated:
+        print("Updating state with new audio log.")
+        # Update the state. Since `audio_log` has no `operator.add`, this is a clean replacement.
+        app_graph.update_state(config, {"audio_log": new_audio_log})
+        # Update the local dictionary that will be returned to the frontend
+        state_dict["audio_log"] = new_audio_log
+
+    return state_dict
+
+# UPDATED: This function now uses the `audio_log` dictionary for combining.
+def _combine_audio_files(audio_log: dict, output_dir: str, thread_id: str) -> Optional[str]:
+    if not audio_log:
+        return None
+
+    # Sort the filenames by turn index (the dictionary key) to ensure correct order
+    sorted_filenames = [audio_log[key] for key in sorted(audio_log.keys())]
+    
+    print(f"Combining {len(sorted_filenames)} audio segments for thread {thread_id}...")
+    combined_audio = AudioSegment.empty()
+    for filename in sorted_filenames:
+        segment_path = os.path.join(output_dir, filename)
+        if os.path.exists(segment_path):
+            try:
+                combined_audio += AudioSegment.from_mp3(segment_path)
+            except Exception as e:
+                print(f"Error loading segment {segment_path}: {e}")
+        else:
+            print(f"Audio segment file not found, skipping: {segment_path}")
+    
+    if len(combined_audio) > 0:
+        final_podcast_filename_only = f"full_podcast_{thread_id}_{int(time.time())}.mp3"
+        final_podcast_full_path = os.path.join(output_dir, final_podcast_filename_only)
+        try:
+            combined_audio.export(final_podcast_full_path, format="mp3")
+            print(f"Exported combined audio to: {final_podcast_full_path}")
+            return final_podcast_filename_only
+        except Exception as e:
+            print(f"Error exporting combined audio: {e}\n{traceback.format_exc()}")
+    
     return None
 
 # --- API Endpoints ---
 
 @app.get("/")
 async def root():
+    # This endpoint remains the same
     finn_status = "Ready" if factual_finn_llm else "Failed"
     casey_status = "Ready" if curious_casey_llm else "Failed"
     general_status = "Ready" if general_llm else "Failed"
@@ -234,6 +308,7 @@ async def root():
 
 @app.post("/process_text_for_rag", response_model=DocumentProcessedResponse)
 async def process_text_for_rag_endpoint(request: ProcessTextRequest):
+    # UPDATED: Initialize AgentState with the new audio_log field
     if not request.text_content.strip():
         raise HTTPException(status_code=400, detail="No text content provided.")
     
@@ -253,12 +328,13 @@ async def process_text_for_rag_endpoint(request: ProcessTextRequest):
         finn_explanation="",
         conversation_history=[],
         current_turn=0,
-        generated_audio_file=None,
+        final_podcast_file=None,
         user_doubt=None,
         current_targeted_theme=None,
         generation_mode="interactive",
         turns_on_current_theme=0,
-        target_turns_for_theme=0
+        target_turns_for_theme=0,
+        audio_log={}
     )
     app_graph.update_state(config, initial_graph_input)
 
@@ -268,9 +344,9 @@ async def process_text_for_rag_endpoint(request: ProcessTextRequest):
         topic_summary=topic_summary
     )
 
-
 @app.post("/process_document_for_rag", response_model=DocumentProcessedResponse)
 async def process_document_for_rag_endpoint(doc_id: str = Form(...), file: UploadFile = File(...)):
+    # UPDATED: Initialize AgentState with the new audio_log field
     if not file.filename.endswith(".pdf"): raise HTTPException(status_code=400, detail="Invalid file type.")
     text_content, tmp_file_path = "", ""
     try:
@@ -297,12 +373,13 @@ async def process_document_for_rag_endpoint(doc_id: str = Form(...), file: Uploa
         finn_explanation="",
         conversation_history=[],
         current_turn=0,
-        generated_audio_file=None,
+        final_podcast_file=None,
         user_doubt=None,
         current_targeted_theme=None,
         generation_mode="interactive",
         turns_on_current_theme=0,
-        target_turns_for_theme=0
+        target_turns_for_theme=0,
+        audio_log={}
     )
     app_graph.update_state(config, initial_graph_input)
 
@@ -312,6 +389,8 @@ async def process_document_for_rag_endpoint(doc_id: str = Form(...), file: Uploa
         topic_summary=topic_summary
     )
 
+
+# ... (explain, ask_follow_up, generate_themes, evaluate_coverage, propose_themes endpoints remain the same) ...
 @app.post("/explain", response_model=dict)
 async def get_explanation_from_finn_model(request: ExplanationRequest):
     if not factual_finn_llm: raise HTTPException(status_code=503, detail="Factual Finn (Ollama) service not initialized.")
@@ -421,7 +500,6 @@ async def propose_themes_endpoint(request: ProposeThemesRequest):
     
     config = {"configurable": {"thread_id": thread_id}}
     
-    # MODIFIED: Removed 'await' as get_state is a synchronous method.
     current_state_snapshot = app_graph.get_state(config)
     
     topic_summary = current_state_snapshot.values.get("initial_user_input", "No topic summary found.")
@@ -473,11 +551,8 @@ async def initiate_podcast_flow_endpoint(thread_id: str, request: StartPodcastRe
                     break
             print("Bulk mode run complete.")
 
-        if request.generate_audio:
-            request_timestamp = int(time.time())
-            final_state_dict["generated_audio_file"] = await _generate_podcast_audio(final_state_dict.get("conversation_history", []), request_timestamp, "podcast_initiate")
-        else:
-            final_state_dict["generated_audio_file"] = None
+        # UPDATED: Call the rewritten audio generation function
+        final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
         
         return final_state_dict
         
@@ -488,18 +563,16 @@ async def initiate_podcast_flow_endpoint(thread_id: str, request: StartPodcastRe
 @app.post("/submit_doubt/{thread_id}", response_model=AgentState)
 async def submit_doubt_endpoint(thread_id: str, request: SubmitDoubtRequest):
     if not app_graph: raise HTTPException(status_code=500, detail="LangGraph app not initialized.")
-    request_timestamp = int(time.time()); print(f"Received doubt for thread_id: {thread_id}. Doubt: '{request.user_doubt_text}', Generate Audio: {request.generate_audio}")
+    print(f"Received doubt for thread_id: {thread_id}. Doubt: '{request.user_doubt_text}'")
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 15}
     input_update = {"user_doubt": request.user_doubt_text}
     try:
         final_state_dict = await app_graph.ainvoke(input_update, config=config)
         print(f"Graph resumed after doubt for {thread_id}. Turns: {final_state_dict.get('current_turn')}")
-        if request.generate_audio:
-            history = final_state_dict.get("conversation_history", []); new_segments_for_tts = []
-            if len(history) >= 2 and history[-2].startswith("User Doubt:") and history[-1].startswith("Factual Finn (addressing doubt):"): new_segments_for_tts.extend(history[-2:])
-            if new_segments_for_tts: final_state_dict["generated_audio_file"] = await _generate_podcast_audio(new_segments_for_tts, request_timestamp, "doubt_response")
-            else: final_state_dict["generated_audio_file"] = None
-        else: final_state_dict["generated_audio_file"] = None
+
+        # UPDATED: Call the rewritten audio generation function
+        final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
+        
         return final_state_dict
     except Exception as e: print(f"Error processing doubt for thread_id {thread_id}: {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail=f"Error processing doubt: {str(e)}")
     
@@ -514,15 +587,44 @@ async def continue_podcast_flow_endpoint(thread_id: str):
     try:
         final_state_dict = await app_graph.ainvoke(None, config=config)
         print(f"Graph resumed and paused again for {thread_id}. Current turns: {final_state_dict.get('current_turn')}")
-        final_state_dict["generated_audio_file"] = None
+        
+        # UPDATED: Call the rewritten audio generation function
+        final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
+        
         return final_state_dict
 
     except Exception as e:
         print(f"Error resuming flow for thread_id {thread_id}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error resuming podcast flow: {str(e)}")
 
+# UPDATED: This endpoint now uses the audio_log.
+@app.post("/create_full_podcast/{thread_id}", response_model=CreateFullPodcastResponse)
+async def create_full_podcast_endpoint(thread_id: str):
+    config = {"configurable": {"thread_id": thread_id}}
+    current_state = app_graph.get_state(config)
+    if not current_state:
+        raise HTTPException(status_code=404, detail="Podcast session not found.")
+
+    audio_log = current_state.values.get("audio_log", {})
+
+    if not audio_log:
+        raise HTTPException(status_code=400, detail="No audio segments found to combine.")
+
+    final_filename = await run_in_threadpool(
+        _combine_audio_files, audio_log, AUDIO_OUTPUT_DIR, thread_id
+    )
+
+    if not final_filename:
+        raise HTTPException(status_code=500, detail="Failed to create combined podcast audio.")
+
+    # Save the final filename to the state
+    app_graph.update_state(config, {"final_podcast_file": final_filename})
+
+    return CreateFullPodcastResponse(final_podcast_file=final_filename)
+
 @app.get("/get_podcast_audio/{filename}")
 async def get_podcast_audio(filename: str):
+    # This endpoint remains the same and works for both segments and the final file
     file_path = os.path.join(AUDIO_OUTPUT_DIR, filename);
     if os.path.exists(file_path): return FileResponse(file_path, media_type='audio/mpeg', filename=filename)
     else: raise HTTPException(status_code=404, detail="Audio file not found.")
