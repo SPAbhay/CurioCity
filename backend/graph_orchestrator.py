@@ -23,8 +23,10 @@ class AgentState(TypedDict):
     generation_mode: str 
     turns_on_current_theme: int
     target_turns_for_theme: int 
-    # NEW: A dictionary to map turn index to audio filename. This will be REPLACED on update.
     audio_log: Dict[int, str]
+    persona_name: str
+    generate_audio: bool 
+    current_sources: List[str]
 
 BACKEND_API_BASE_URL = os.getenv("BACKEND_API_URL", "http://127.0.0.1:8000")
 TURNS_PER_THEME_RANGE = (1, 3) 
@@ -107,23 +109,44 @@ async def invoke_curious_casey(state: AgentState) -> dict:
     }
 
 
-async def invoke_factual_finn_explain(state: AgentState) -> dict:
-    print("---NODE: FACTUAL_FINN_EXPLAIN (RAG Enabled)---")
-    casey_question, doc_id, initial_topic = state.get("casey_question"), state.get("doc_id"), state.get("initial_user_input")
-    if not all([casey_question, doc_id]): return {"finn_explanation": "Error: Missing context/doc_id for RAG.", "conversation_history": ["System: Error: Missing context for Finn."]}
-    print(f"Finn received question: '{casey_question}' for doc_id: '{doc_id}'")
-    payload = {"instruction": casey_question, "doc_id": doc_id, "original_topic_or_context": initial_topic}
+async def invoke_knowledgeable_persona_explain(state: AgentState) -> dict:
+    print("---NODE: KNOWLEDGEABLE_PERSONA_EXPLAIN (RAG Enabled)---")
+    casey_question = state.get("casey_question")
+    doc_id = state.get("doc_id")
+    initial_topic = state.get("initial_user_input")
+    persona_name = state.get("persona_name", "factual-finn") 
+
+    if not all([casey_question, doc_id]): 
+        return {"finn_explanation": "Error: Missing context/doc_id for RAG.", "conversation_history": ["System: Error: Missing context for Finn."]}
+
+    print(f"Persona '{persona_name}' received question: '{casey_question}' for doc_id: '{doc_id}'")
+    
+    payload = {
+        "instruction": casey_question, 
+        "doc_id": doc_id, 
+        "original_topic_or_context": initial_topic,
+        "persona_name": persona_name
+    }
     api_url = f"{BACKEND_API_BASE_URL}/explain"
-    finn_explanation_text, new_history_entry = "I could not provide an explanation at this time using RAG.", ""
+    explanation_text, new_history_entry = f"I could not provide an explanation as {persona_name} at this time.", ""
+    
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(api_url, json=payload, timeout=180.0); response.raise_for_status()
-            finn_explanation_text = response.json().get("explanation", finn_explanation_text)
-        print(f"Finn (RAG) generated explanation: '{finn_explanation_text[:100]}...'")
-        new_history_entry = f"Factual Finn: {finn_explanation_text}"
+            response_data = response.json()
+            explanation_text = response_data.get("explanation", explanation_text)
+            # NEW: Get the sources from the response
+            sources = response_data.get("sources", [])
+        
+        persona_display_name = persona_name.replace('-', ' ').title()
+        print(f"{persona_display_name} (RAG) generated explanation: '{explanation_text[:100]}...'")
+        new_history_entry = f"{persona_display_name}: {explanation_text}"
+
     except Exception as e:
-        print(f"Error in invoke_factual_finn_explain (RAG) API call: {e}"); new_history_entry = f"Error: Factual Finn failed to provide RAG explanation - {str(e)}"
-    return {"finn_explanation": finn_explanation_text, "conversation_history": [new_history_entry]}
+        print(f"Error in invoke_knowledgeable_persona_explain (RAG) API call: {e}"); new_history_entry = f"Error: Persona failed to provide RAG explanation - {str(e)}"
+        sources = []
+    
+    return {"finn_explanation": explanation_text, "conversation_history": [new_history_entry], "current_sources": sources}
 
 async def evaluate_theme_coverage(state: AgentState) -> dict:
     print("---NODE: EVALUATE_THEME_COVERAGE---")
@@ -207,15 +230,15 @@ workflow = StateGraph(AgentState)
 
 # Add nodes
 workflow.add_node("CURIOUS_CASEY", invoke_curious_casey)
-workflow.add_node("FACTUAL_FINN_EXPLAIN", invoke_factual_finn_explain)
+workflow.add_node("KNOWLEDGEABLE_PERSONA_EXPLAIN", invoke_knowledgeable_persona_explain)
 workflow.add_node("EVALUATE_THEME_COVERAGE", evaluate_theme_coverage)
 workflow.add_node("FACTUAL_FINN_ANSWER_DOUBT", invoke_factual_finn_on_doubt)
 
 workflow.set_entry_point("CURIOUS_CASEY")
 
 # Define edges
-workflow.add_edge("CURIOUS_CASEY", "FACTUAL_FINN_EXPLAIN")
-workflow.add_edge("FACTUAL_FINN_EXPLAIN", "EVALUATE_THEME_COVERAGE")
+workflow.add_edge("CURIOUS_CASEY", "KNOWLEDGEABLE_PERSONA_EXPLAIN")
+workflow.add_edge("KNOWLEDGEABLE_PERSONA_EXPLAIN", "EVALUATE_THEME_COVERAGE")
 
 workflow.add_conditional_edges(
     "EVALUATE_THEME_COVERAGE",

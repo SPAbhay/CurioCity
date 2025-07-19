@@ -32,15 +32,22 @@ load_dotenv()
 
 # --- Configuration (remains the same) ---
 OLLAMA_FACTUAL_FINN_MODEL_NAME = "factual-finn"
+OLLAMA_EXAMPLE_EVE_MODEL_NAME = "example-eve"    
+OLLAMA_ANALOGY_ALEX_MODEL_NAME = "analogy-alex"   
 OLLAMA_CURIOUS_CASEY_MODEL_NAME = "curious-casey"
 OLLAMA_GENERAL_MODEL_NAME = os.getenv("OLLAMA_GENERAL_MODEL", "llama3.1")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 CASEY_VOICE_ID = os.getenv("CASEY_VOICE_ID", "F2OOWcJMWhX8wCsyT0oR")
 FINN_VOICE_ID = os.getenv("FINN_VOICE_ID", "IFEvkitzF8OoHeggkJUu")
+EVE_VOICE_ID = os.getenv("EVE_VOICE_ID", "6BZyx2XekeeXOkTVn8un")
+ALEX_VOICE_ID = os.getenv("ALEX_VOICE_ID", "GTiuKhCAJGILEG2FelGh")
+
 NARRATOR_VOICE_ID = os.getenv("NARRATOR_VOICE_ID", CASEY_VOICE_ID)
 CASEY_TTS_MODEL_ID = os.getenv("CASEY_TTS_MODEL_ID", "eleven_turbo_v2_5")
-FINN_TTS_MODEL_ID = os.getenv("FINN_TTS_MODEL_ID", "eleven_multilingual_v2")
+FINN_TTS_MODEL_ID = os.getenv("FINN_TTS_MODEL_ID", "eleven_turbo_v2_5")
+EVE_TTS_MODEL_ID = os.getenv("EVE_TTS_MODEL_ID", "eleven_turbo_v2_5")
+ALEX_TTS_MODEL_ID = os.getenv("ALEX_TTS_MODEL_ID", "eleven_turbo_v2_5")
 NARRATOR_TTS_MODEL_ID = os.getenv("NARRATOR_TTS_MODEL_ID", CASEY_TTS_MODEL_ID)
 AUDIO_OUTPUT_DIR = "audio_outputs"
 
@@ -58,14 +65,16 @@ alpaca_prompt_template_str = """Below is an instruction that describes a task, p
 # --- Global LLM clients (remains the same) ---
 factual_finn_llm = None
 curious_casey_llm = None
+example_eve_llm = None  
+analogy_alex_llm = None  
 general_llm = None
 
 # --- Lifespan function (remains the same) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global factual_finn_llm, curious_casey_llm, general_llm, app_graph
+    global factual_finn_llm, curious_casey_llm, general_llm, app_graph, example_eve_llm, analogy_alex_llm
     os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
-    
+
     # Initialize Factual Finn
     print(f"Initializing ChatOllama for Factual Finn: {OLLAMA_FACTUAL_FINN_MODEL_NAME}...")
     try:
@@ -81,6 +90,21 @@ async def lifespan(app: FastAPI):
         print("Curious Casey ChatOllama client initialized.")
     except Exception as e:
         print(f"Error initializing Curious Casey ChatOllama client: {e}\n{traceback.format_exc()}")
+
+    print(f"Initializing ChatOllama for Example Eve: {OLLAMA_EXAMPLE_EVE_MODEL_NAME}...")
+    try:
+        example_eve_llm = ChatOllama(model=OLLAMA_EXAMPLE_EVE_MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.7)
+        print("Example Eve ChatOllama client initialized.")
+    except Exception as e:
+        print(f"Error initializing Example Eve ChatOllama client: {e}\n{traceback.format_exc()}")
+
+    # NEW: Initialize Analogy Alex
+    print(f"Initializing ChatOllama for Analogy Alex: {OLLAMA_ANALOGY_ALEX_MODEL_NAME}...")
+    try:
+        analogy_alex_llm = ChatOllama(model=OLLAMA_ANALOGY_ALEX_MODEL_NAME, base_url=OLLAMA_BASE_URL, temperature=0.7)
+        print("Analogy Alex ChatOllama client initialized.")
+    except Exception as e:
+        print(f"Error initializing Analogy Alex ChatOllama client: {e}\n{traceback.format_exc()}")
 
     # Initialize General Purpose LLM
     print(f"Initializing ChatOllama for General Use: {OLLAMA_GENERAL_MODEL_NAME}...")
@@ -117,6 +141,7 @@ class StartPodcastRequest(BaseModel):
     doc_id: str
     generate_audio: bool = False
     generation_mode: str
+    persona_name: str
 
 class PodcastFlowResponse(BaseModel):
     thread_id: str
@@ -132,6 +157,7 @@ class ExplanationRequest(BaseModel):
     instruction: str
     doc_id: str
     original_topic_or_context: Optional[str] = None
+    persona_name: str
 
 class FollowUpRequest(BaseModel):
     previous_statement: str
@@ -159,6 +185,10 @@ class DocumentProcessedResponse(BaseModel):
     message: str
     doc_id: str
     topic_summary: str
+    
+class ExplanationResponse(BaseModel):
+    explanation: str
+    sources: List[str]
 
 # --- Helper Functions ---
 
@@ -192,23 +222,24 @@ async def _summarize_text_for_topic(text_content: str) -> str:
 
 
 async def _generate_audio_for_turn(turn_text: str, turn_index: int) -> Optional[str]:
-    # This function is correct and remains the same
     speaker_label, text_to_speak, current_voice_id, current_model_id = "", "", "", ""
+    
+    speaker_voices = {
+        "Curious Casey": (CASEY_VOICE_ID, CASEY_TTS_MODEL_ID),
+        "Factual Finn": (FINN_VOICE_ID, FINN_TTS_MODEL_ID),
+        "Example Eve": (EVE_VOICE_ID, FINN_TTS_MODEL_ID),  
+        "Analogy Alex": (ALEX_VOICE_ID, FINN_TTS_MODEL_ID),
+        "Initial Topic": (NARRATOR_VOICE_ID, NARRATOR_TTS_MODEL_ID)
+    }
 
-    if turn_text.startswith("Curious Casey:"):
-        speaker_label, text_to_speak = "Casey", turn_text.replace("Curious Casey: ", "", 1).strip()
-        current_voice_id, current_model_id = CASEY_VOICE_ID, CASEY_TTS_MODEL_ID
-    elif turn_text.startswith("Factual Finn (addressing doubt):"):
-        speaker_label, text_to_speak = "Finn_Doubt", turn_text.replace("Factual Finn (addressing doubt): ", "", 1).strip()
-        current_voice_id, current_model_id = FINN_VOICE_ID, FINN_TTS_MODEL_ID
-    elif turn_text.startswith("Factual Finn:"):
-        speaker_label, text_to_speak = "Finn", turn_text.replace("Factual Finn: ", "", 1).strip()
-        current_voice_id, current_model_id = FINN_VOICE_ID, FINN_TTS_MODEL_ID
-    elif turn_text.startswith("Initial Topic:"):
-        speaker_label, text_to_speak = "Narrator", turn_text.replace("Initial Topic: ", "", 1).strip()
-        current_voice_id, current_model_id = NARRATOR_VOICE_ID, NARRATOR_TTS_MODEL_ID
-    else:
-        return None
+    for speaker, (voice_id, model_id) in speaker_voices.items():
+        if turn_text.startswith(f"{speaker}:"):
+            speaker_label = speaker.replace(" ", "_")
+            text_to_speak = turn_text.replace(f"{speaker}: ", "", 1).strip()
+            if speaker == "Factual Finn" and "(addressing doubt)" in turn_text:
+                 text_to_speak = turn_text.replace("Factual Finn (addressing doubt): ", "", 1).strip()
+            current_voice_id, current_model_id = voice_id, model_id
+            break
 
     if not text_to_speak:
         return None
@@ -334,7 +365,9 @@ async def process_text_for_rag_endpoint(request: ProcessTextRequest):
         generation_mode="interactive",
         turns_on_current_theme=0,
         target_turns_for_theme=0,
-        audio_log={}
+        audio_log={}, 
+        persona_name="factual-finn",
+        generate_audio=False
     )
     app_graph.update_state(config, initial_graph_input)
 
@@ -346,7 +379,6 @@ async def process_text_for_rag_endpoint(request: ProcessTextRequest):
 
 @app.post("/process_document_for_rag", response_model=DocumentProcessedResponse)
 async def process_document_for_rag_endpoint(doc_id: str = Form(...), file: UploadFile = File(...)):
-    # UPDATED: Initialize AgentState with the new audio_log field
     if not file.filename.endswith(".pdf"): raise HTTPException(status_code=400, detail="Invalid file type.")
     text_content, tmp_file_path = "", ""
     try:
@@ -379,7 +411,9 @@ async def process_document_for_rag_endpoint(doc_id: str = Form(...), file: Uploa
         generation_mode="interactive",
         turns_on_current_theme=0,
         target_turns_for_theme=0,
-        audio_log={}
+        audio_log={},
+        persona_name="factual-finn",
+        generate_audio=False
     )
     app_graph.update_state(config, initial_graph_input)
 
@@ -391,25 +425,49 @@ async def process_document_for_rag_endpoint(doc_id: str = Form(...), file: Uploa
 
 
 # ... (explain, ask_follow_up, generate_themes, evaluate_coverage, propose_themes endpoints remain the same) ...
-@app.post("/explain", response_model=dict)
-async def get_explanation_from_finn_model(request: ExplanationRequest):
-    if not factual_finn_llm: raise HTTPException(status_code=503, detail="Factual Finn (Ollama) service not initialized.")
+@app.post("/explain", response_model=ExplanationResponse)
+async def get_explanation_from_persona(request: ExplanationRequest):
+    # Dictionary mapping persona names to their LLM clients
+    persona_llms = {
+        "factual-finn": factual_finn_llm,
+        "example-eve": example_eve_llm,
+        "analogy-alex": analogy_alex_llm,
+    }
+    
+    selected_llm = persona_llms.get(request.persona_name)
+    
+    if not selected_llm:
+        raise HTTPException(status_code=400, detail=f"Invalid persona name: {request.persona_name}")
+    if not selected_llm: 
+        raise HTTPException(status_code=503, detail=f"Persona '{request.persona_name}' service not initialized.")
+
     retriever = get_retriever_for_doc(request.doc_id)
     if not retriever: raise HTTPException(status_code=404, detail=f"No document found for doc_id: {request.doc_id}.")
-    query_for_retrieval = request.instruction
-    try:
-        relevant_docs = await retriever.ainvoke(query_for_retrieval)
-    except Exception as e:
-        print(f"Error during RAG retrieval: {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail="Failed to retrieve relevant documents.")
-    retrieved_context = "\n\n".join([doc.page_content for doc in relevant_docs]) if relevant_docs else "No specific context found in the document for this query."
-    final_instruction_for_finn = f"Please answer the following question in a direct and factual style, focusing on key points. Use only the provided context.\n\nQuestion: {request.instruction}"
+    
+    relevant_docs = await retriever.ainvoke(request.instruction)
+    
+    source_texts = [doc.page_content for doc in relevant_docs]
+    retrieved_context = "\n\n".join(source_texts)
+    
+    final_instruction_for_finn = (
+        f"Based strictly on the provided context, answer the following question. "
+        f"Do not use any outside knowledge. If the answer is not found in the context, "
+        f"state that you cannot answer based on the provided document.\n\n"
+        f"Question: {request.instruction}"
+    )
     final_input_text_for_finn = f"Context to use for the answer:\n'''\n{retrieved_context}\n'''"
+    
     prompt_to_ollama = alpaca_prompt_template_str.format(instruction=final_instruction_for_finn, input_text=final_input_text_for_finn)
     try:
-        response = await factual_finn_llm.ainvoke(prompt_to_ollama, stop=["### Instruction:"])
-        return {"explanation": response.content.strip()}
-    except Exception as e: print(f"Error in /explain endpoint (Ollama call): {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail=f"Error generating RAG explanation: {str(e)}")
-
+        response = await selected_llm.ainvoke(prompt_to_ollama, stop=["### Instruction:"])
+        explanation = response.content.strip()
+        
+        return ExplanationResponse(explanation=explanation, sources=source_texts)
+        
+    except Exception as e: 
+        print(f"Error in /explain endpoint (Ollama call): {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error generating RAG explanation: {str(e)}")
+    
 @app.post("/ask_follow_up", response_model=dict)
 async def get_question_from_casey_model(request: FollowUpRequest):
     if not curious_casey_llm: raise HTTPException(status_code=503, detail="Curious Casey (Ollama) service not initialized.")
@@ -534,7 +592,9 @@ async def initiate_podcast_flow_endpoint(thread_id: str, request: StartPodcastRe
     
     state_update = {
         "guiding_themes": request.final_themes,
-        "generation_mode": request.generation_mode
+        "generation_mode": request.generation_mode,
+        "persona_name": request.persona_name,
+        "generate_audio": request.generate_audio
     }
     app_graph.update_state(config, state_update)
 
@@ -552,7 +612,8 @@ async def initiate_podcast_flow_endpoint(thread_id: str, request: StartPodcastRe
             print("Bulk mode run complete.")
 
         # UPDATED: Call the rewritten audio generation function
-        final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
+        if final_state_dict.get("generate_audio", False):
+            final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
         
         return final_state_dict
         
@@ -571,7 +632,8 @@ async def submit_doubt_endpoint(thread_id: str, request: SubmitDoubtRequest):
         print(f"Graph resumed after doubt for {thread_id}. Turns: {final_state_dict.get('current_turn')}")
 
         # UPDATED: Call the rewritten audio generation function
-        final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
+        if final_state_dict.get("generate_audio", False):
+            final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
         
         return final_state_dict
     except Exception as e: print(f"Error processing doubt for thread_id {thread_id}: {e}\n{traceback.format_exc()}"); raise HTTPException(status_code=500, detail=f"Error processing doubt: {str(e)}")
@@ -589,7 +651,8 @@ async def continue_podcast_flow_endpoint(thread_id: str):
         print(f"Graph resumed and paused again for {thread_id}. Current turns: {final_state_dict.get('current_turn')}")
         
         # UPDATED: Call the rewritten audio generation function
-        final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
+        if final_state_dict.get("generate_audio", False):
+            final_state_dict = await _generate_audio_and_update_log(final_state_dict, thread_id)
         
         return final_state_dict
 

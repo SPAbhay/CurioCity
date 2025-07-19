@@ -21,6 +21,7 @@ const audioLog = computed(() => currentPodcastState.value?.audio_log || {});
 const isPodcastActive = computed(() => currentThreadId.value !== null);
 const guidingThemes = computed(() => currentPodcastState.value?.guiding_themes || []);
 const coveredThemes = computed(() => currentPodcastState.value?.covered_themes || []);
+const currentSources = computed(() => currentPodcastState.value?.current_sources || []);
 
 const isPodcastFinished = computed(() => {
   if (!currentPodcastState.value?.guiding_themes || !isPodcastActive.value) {
@@ -127,6 +128,7 @@ const handleDownloadFullPodcast = async () => {
     <PodcastDisplay
       :conversationHistory="conversationLog"
       :audioLog="audioLog"
+      :currentSources="currentSources"
     />
 
     <div class="controls" v-if="isPodcastActive && !isPodcastFinished && generationMode === 'interactive'">
@@ -135,11 +137,11 @@ const handleDownloadFullPodcast = async () => {
       </button>
     </div>
 
-    <div class="controls" v-if="isPodcastFinished">
+    <div class="controls" v-if="isPodcastFinished && currentPodcastState?.generate_audio">
       <button @click="handleDownloadFullPodcast" :disabled="isDownloading">
-        {{ isDownloading ? 'Preparing Download...' : 'Download Full Podcast' }}
+          {{ isDownloading ? 'Preparing Download...' : 'Download Full Podcast' }}
       </button>
-    </div>
+  </div>
 
     <InteractionControls
       v-if="isPodcastActive && !isPodcastFinished && generationMode === 'interactive'"
