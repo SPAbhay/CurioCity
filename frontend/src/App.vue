@@ -1,27 +1,33 @@
 <script setup>
 import { ref, computed } from 'vue';
-import axios from 'axios'; // Import axios
+import axios from 'axios';
 import SetupForm from './components/SetupForm.vue';
 import PodcastDisplay from './components/PodcastDisplay.vue';
 import AudioControls from './components/AudioControls.vue';
 import InteractionControls from './components/InteractionControls.vue';
+import ThemeTracker from './components/ThemeTracker.vue'; // 1. Import the new component
 
 // --- State Management ---
-const currentPodcastState = ref(null); // Will hold the 'state' object from the API response
-const currentThreadId = ref(null);    // Will hold the 'thread_id' for the current conversation
-const currentDocId = ref(null);       // Will hold the 'doc_id' after a document is processed
-const isLoading = ref(false);         // NEW: Added to manage loading state for the 'Next Turn' button
+const currentPodcastState = ref(null);
+const currentThreadId = ref(null);
+const currentDocId = ref(null);
+const isLoading = ref(false);
+const generationMode = ref(null);
 
 // --- Computed Properties for Child Components ---
 const conversationLog = computed(() => currentPodcastState.value?.conversation_history || []);
 const generatedAudioFile = computed(() => currentPodcastState.value?.generated_audio_file || null);
 const isPodcastActive = computed(() => currentThreadId.value !== null);
 
+// NEW: Computed properties to pass to the ThemeTracker
+const guidingThemes = computed(() => currentPodcastState.value?.guiding_themes || []);
+const coveredThemes = computed(() => currentPodcastState.value?.covered_themes || []);
+
+
 // --- Event Handlers ---
 const handleDocumentProcessed = (docId) => {
   console.log("App.vue: Received 'document-processed' event with doc_id:", docId);
   currentDocId.value = docId;
-  // Reset any previous podcast data when a new document is processed
   currentPodcastState.value = null;
   currentThreadId.value = null;
 };
@@ -30,6 +36,7 @@ const handlePodcastGenerated = (apiResponse) => {
   console.log("App.vue: Received 'podcast-generated' event with payload:", apiResponse);
   currentThreadId.value = apiResponse.thread_id;
   currentPodcastState.value = apiResponse.state;
+  generationMode.value = apiResponse.state.generation_mode;
 };
 
 const handleNewDoubtResponse = (updatedState) => {
@@ -42,7 +49,6 @@ const handleDoubtError = (errorMessage) => {
   alert(`Error submitting your doubt: ${errorMessage}`);
 }
 
-// --- NEW: Function to handle the 'Next Turn' button click ---
 const handleContinue = async () => {
     if (!currentThreadId.value) {
         console.error("Cannot continue, threadId is missing.");
@@ -50,15 +56,10 @@ const handleContinue = async () => {
     }
     isLoading.value = true;
     try {
-        // Calls the new backend endpoint to resume the graph
         const response = await axios.post(`http://127.0.0.1:8000/continue_flow/${currentThreadId.value}`);
         const newState = response.data;
-        
         console.log("App.vue: Received new state after continue", newState);
-        
-        // Update the main state object. The conversationLog will update automatically via the computed property.
         currentPodcastState.value = newState;
-
     } catch (error) {
         console.error("Error calling continue API:", error);
         alert(`Failed to get next turn: ${error.response?.data?.detail || error.message}`);
@@ -66,7 +67,6 @@ const handleContinue = async () => {
         isLoading.value = false;
     }
 };
-
 </script>
 
 <template>
@@ -80,11 +80,17 @@ const handleContinue = async () => {
       @document-processed="handleDocumentProcessed"
       @podcast-generated="handlePodcastGenerated" 
     />
+
+    <!-- 2. Add the new component here -->
+    <ThemeTracker
+      v-if="isPodcastActive"
+      :guiding-themes="guidingThemes"
+      :covered-themes="coveredThemes"
+    />
     
     <PodcastDisplay :conversationHistory="conversationLog" />
 
-    <!-- This button section is now fully functional with the new script logic -->
-    <div class="controls" v-if="currentPodcastState && currentPodcastState.current_turn > 0">
+    <div class="controls" v-if="currentPodcastState && currentPodcastState.current_turn > 0 && generationMode === 'interactive'">
         <button @click="handleContinue" :disabled="isLoading">
             {{ isLoading ? 'Generating...' : 'Next Turn' }}
         </button>
@@ -96,7 +102,7 @@ const handleContinue = async () => {
     />
 
     <InteractionControls 
-      v-if="isPodcastActive && conversationLog.length > 0"
+      v-if="isPodcastActive && conversationLog.length > 0 && generationMode === 'interactive'"
       :isPodcastActive="isPodcastActive"
       :threadId="currentThreadId"
       :docId="currentDocId"
@@ -130,7 +136,6 @@ h1 {
   color: #aaa;
   margin-top: 0.5rem;
 }
-/* NEW: Added simple styling for the controls container */
 .controls {
   text-align: center;
   margin: 20px 0;
